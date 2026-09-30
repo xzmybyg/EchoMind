@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+target/
+bin/
+obj/
+.models/
+.runtime/
+*.pcm
+*.wav
