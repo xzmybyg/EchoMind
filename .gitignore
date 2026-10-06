@@ -10,3 +10,5 @@ obj/
 .runtime/
 *.pcm
 *.wav
+build/
+dist/

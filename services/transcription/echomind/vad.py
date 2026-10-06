@@ -12,7 +12,7 @@ import sys
 
 
 class EnergyVAD:
-    def __init__(self, min_rms: float = 90.0, noise_multiplier: float = 2.5) -> None:
+    def __init__(self, min_rms: float = 60.0, noise_multiplier: float = 2.5) -> None:
         self.min_rms = min_rms
         self.noise_multiplier = noise_multiplier
         self.noise_rms = 30.0

@@ -14,6 +14,7 @@ from time import perf_counter
 from typing import Callable, Literal
 
 from .vad import EnergyVAD
+from .text import normalize_transcript
 
 
 SAMPLE_RATE = 16_000
@@ -27,6 +28,7 @@ class TranscriptEvent:
     text: str
     timestamp_ms: int
     latency_ms: float
+    suspect: bool = False
 
 
 def _join_without_overlap(previous: str, current: str) -> str:
@@ -49,9 +51,10 @@ class Transcriber:
         recognizer: Callable[[bytes], str] | None = None,
         vad: EnergyVAD | None = None,
         partial_interval_ms: int = 700,
-        min_speech_ms: int = 240,
+        min_speech_ms: int = 180,
         end_silence_ms: int = 600,
         max_utterance_ms: int = 12_000,
+        hotwords: str | None = None,
     ) -> None:
         self.model_size = model_size
         self.device = device
@@ -63,6 +66,9 @@ class Transcriber:
         self.min_speech_ms = min_speech_ms
         self.end_silence_ms = end_silence_ms
         self.max_utterance_ms = max_utterance_ms
+        # Optional short terms, never a natural-language instruction or sentence.
+        self.hotwords = hotwords
+        self._last_suspect = False
 
         self._pending = bytearray()
         self._preroll: deque[bytes] = deque(maxlen=7)  # 210 ms
@@ -80,10 +86,16 @@ class Transcriber:
     def warm_up(self) -> None:
         """Load the model and complete its first inference before capture starts."""
         if self._recognizer is None:
-            self._transcribe(bytes(SAMPLE_RATE * 2))
+            self._transcribe(bytes(SAMPLE_RATE * 2), warmup=True)
 
-    def _transcribe(self, pcm: bytes) -> tuple[str, float]:
+    def _transcribe(
+        self, pcm: bytes, *, final: bool = False, warmup: bool = False
+    ) -> tuple[str, float]:
         started = perf_counter()
+        self._last_suspect = False
+        # Warmup must still initialize/infer; real digital silence must not decode.
+        if not warmup and not any(pcm):
+            return "", (perf_counter() - started) * 1000
         if self._recognizer is not None:
             result = self._recognizer(pcm)
         else:
@@ -96,18 +108,34 @@ class Transcriber:
             import numpy as np
 
             samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+            # Only boost quiet, gated utterances; cap gain to avoid magnifying noise.
+            peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+            if 0.0 < peak < 0.1:
+                samples *= min(8.0, 0.1 / peak)
             segments, _ = self._model.transcribe(
                 samples,
                 language="zh",
-                beam_size=1,
+                beam_size=5 if final else 1,
+                temperature=0.0,
                 condition_on_previous_text=False,
                 vad_filter=False,
+                hotwords=self.hotwords if final else None,
             )
-            result = "".join(segment.text for segment in segments)
-        return result.strip(), (perf_counter() - started) * 1000
+            texts = []
+            for segment in segments:
+                no_speech = getattr(segment, "no_speech_prob", 0.0)
+                logprob = getattr(segment, "avg_logprob", 0.0)
+                # Follow Whisper's joint silence/likelihood test, not either alone.
+                if no_speech > 0.6 and logprob <= -1.0:
+                    continue
+                if no_speech > 0.5 or logprob < -0.8:
+                    self._last_suspect = True
+                texts.append(segment.text)
+            result = "".join(texts)
+        return normalize_transcript(result), (perf_counter() - started) * 1000
 
     def _event(self, kind: Literal["partial", "final"], timestamp_ms: int) -> TranscriptEvent | None:
-        text, latency_ms = self._transcribe(bytes(self._audio))
+        text, latency_ms = self._transcribe(bytes(self._audio), final=kind == "final")
         if self._carried_overlap:
             text = _join_without_overlap(self._previous_final, text)
         if not text or (kind == "partial" and text == self._last_partial):
@@ -116,7 +144,7 @@ class Transcriber:
             self._last_partial = text
         else:
             self._previous_final = (self._previous_final + text)[-200:]
-        return TranscriptEvent(kind, text, timestamp_ms, latency_ms)
+        return TranscriptEvent(kind, text, timestamp_ms, latency_ms, self._last_suspect)
 
     def _finish(self, timestamp_ms: int, *, carry: bool = False) -> list[TranscriptEvent]:
         events: list[TranscriptEvent] = []

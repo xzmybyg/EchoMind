@@ -3,7 +3,11 @@ param(
     [ValidateSet('tiny', 'large-v3-turbo')]
     [string]$Model = 'large-v3-turbo',
     [ValidateSet('cuda', 'cpu')]
-    [string]$Device = 'cuda'
+    [string]$Device = 'cuda',
+    [ValidateSet('off', 'demo', 'live')]
+    [string]$Answers = 'off',
+    [ValidateSet('rules', 'jev')]
+    [string]$QuestionGate = 'rules'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,7 +36,8 @@ if ($Device -eq 'cuda') {
 
 $precision = if ($Device -eq 'cuda') { 'int8_float16' } else { 'int8' }
 $arguments = @('-m', 'echomind.cli', '--capture-exe', $capture,
-    '--model', $modelDirectory, '--device', $Device, '--compute-type', $precision)
+    '--model', $modelDirectory, '--device', $Device, '--compute-type', $precision,
+    '--answers', $Answers, '--question-gate', $QuestionGate)
 if ($TargetPid -gt 0) {
     $arguments += @('--pid', "$TargetPid")
 }
