@@ -37,7 +37,11 @@ This version uses Windows application process loopback: it captures the selected
 
 ## Windows 窗口版
 
-最新窗口版入口：`dist/update-verified-release/EchoMind/EchoMind.exe`（旧版保留在原目录）。双击即可运行，无需打开命令行。请保留整个 `EchoMind` 文件夹，不能只移动 EXE；文件夹包含 Python、中文识别模型、CUDA 和音频采集组件，约 3.15 GiB。
+轻量窗口版入口：`dist/light-v0.1.2/EchoMind/EchoMind.exe`（旧版保留在原目录）。双击即可运行，无需打开命令行。请保留整个 `EchoMind` 文件夹，不能只移动 EXE；主程序只含 Python 运行时和音频采集组件，不再捆绑模型与独立 CUDA，压缩后约 129 MiB。
+
+首次启动会打开“语音组件”窗口，选择 GPU 或 CPU 后点击“下载并准备”。中文识别模型下载约 1.39 GiB，GPU 组件另需约 918 MiB；CPU 不下载 GPU 组件。下载来自已发布的 EchoMind v0.1.1 GitHub Release，固定 SHA-256 校验后安装；网络不通可稍后重试，取消或中断的下载支持续传（服务器不支持续传时重新下载）。选择 GPU 仍需支持 CUDA 的 NVIDIA 显卡和系统驱动，此功能不安装显卡驱动。组件保存在 `%LOCALAPPDATA%\EchoMind\components`，应用更新后复用；模型和 GPU 顺序安装，需额外空间容纳压缩包与解压暂存（首次 GPU 全量准备建议缓存盘至少空闲 5 GiB）。
+
+可关闭准备窗口，先进行文字/截图回答；开始采集前会再次检查缺失组件。左下角“设置 + → 组件管理”可查看路径、切换设备并重试。完整旧版程序旁的 `models/large-v3-turbo` 和 `cuda` 优先复用，不重复下载；下载只写用户缓存，不改旧版程序、配置或密钥。失败的安装不启用临时文件，不完整的旧缓存保留为 `.backup-*` 供恢复。
 
 窗口采用 Ant Design 风格的蓝色操作、浅灰背景、白色卡片、分层标题与标签页，统一输入框、列表选中和键盘焦点状态。主操作按钮使用较深蓝色以保持白色文字可读性。当前仍是 Tkinter 原生桌面实现，不包含 antd React 组件，也不更改语音识别、纠错和配置流程。
 
@@ -93,9 +97,9 @@ This version uses Windows application process loopback: it captures the selected
 开发者发布流程（本次实现不会自动创建 Release）：
 
 1. 修改 `services/transcription/echomind/version.py` 的 `VERSION` 与 `services/transcription/pyproject.toml` 版本，再打包到新目录。
-2. 运行 `.\.venv\Scripts\python.exe scripts/package-update.py dist/update-verified-release/EchoMind dist/update-assets` 生成 `EchoMind-update.zip`；脚本核对 EXE 内版本，拒绝覆盖已有 ZIP。
-3. 在 GitHub 创建对应的正式 Release，例如 `v0.1.1`，附上更新说明，并上传该 ZIP。GitHub 接口应提供资产的 `sha256:...` digest。
-4. 下次发布更高版本（例如 `v0.1.2`）后，本次 `0.1.1` 应用才能检测到更新。
+2. 运行 `.\.venv\Scripts\python.exe scripts/package-update.py dist/light-v0.1.2/EchoMind dist/light-v0.1.2-update` 生成 `EchoMind-update.zip`；脚本核对 EXE 内版本，拒绝覆盖已有 ZIP。
+3. 在 GitHub 创建对应的正式 Release，例如 `v0.1.2`，附上更新说明，并上传该 ZIP。GitHub 接口应提供资产的 `sha256:...` digest。语音组件复用 v0.1.1 的模型/GPU 资产，请保留该 Release 和组件文件。
+4. 下次发布更高版本（例如 `v0.1.3`）后，本次 `0.1.2` 应用才能检测到更新。
 
 更新 ZIP 仅包含 `EchoMind.exe`、`_internal`、`capture` 和 `update.json`，不重复下载模型和独立 CUDA 目录，也不覆盖配置与密钥。下载缓存位于 `%LOCALAPPDATA%\EchoMind\updates`；安装目录内 `.update-backup-*` 保留旧程序供恢复，失败的替换文件保留在 `.update-failed-*`。更新准备副本先放到应用所在盘，支持 C 盘下载、D 盘安装。当前不会自动删除旧版备份；更新需要足够空间容纳下载、准备副本和备份。这是目录版基础更新器，不支持安装器、跨 Python 大版本运行时迁移或完整的系统安装事务。
 
@@ -111,7 +115,7 @@ This version uses Windows application process loopback: it captures the selected
 
 采集期间编辑框仍可使用，提交到同一个回答会话，不会重新启动或停止音频采集。提交新问题会取消旧回答。当前回答上的“编辑当前问题”、问题记录页的“编辑选中问题”会复制问题到编辑框；修改后提交产生新记录，原问题和原回答保持不变。草稿不保存到配置文件。
 
-开发者从源码启动窗口：`.\.venv\Scripts\pythonw.exe -m echomind.gui`。重新打包使用 `scripts/build-desktop.ps1`，需已有本地模型和 CUDA 文件，并指定未包含旧 EchoMind 包的输出目录；脚本不会覆盖已有包。
+开发者从源码启动窗口：`.\.venv\Scripts\pythonw.exe -m echomind.gui`。开发环境继续复用仓库 `.models/large-v3-turbo` 和 `.runtime/cuda12`，不强制联网下载，也不改 CLI 的既有路径。重新打包使用 `scripts/build-desktop.ps1 -OutputDirectory dist/light-v0.1.2`，默认轻量，不要求本地模型/CUDA 构建输入；离线完整包可加 `-IncludeComponents`（需要已有本地组件）。指定未包含旧 EchoMind 包的输出目录，脚本不会覆盖已有包。
 
 ## MVP 2: 中文问题与流式回答
 

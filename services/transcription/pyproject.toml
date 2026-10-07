@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "echomind-transcription"
-version = "0.1.1"
+version = "0.1.2"
 description = "EchoMind real-time Chinese captions MVP"
 requires-python = ">=3.11"
 dependencies = [

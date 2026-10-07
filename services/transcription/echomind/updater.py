@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -49,7 +50,7 @@ def version_tuple(value: str) -> tuple[int, int, int]:
 
 def check_release(*, current=VERSION, client=None) -> Release | None:
     if client is None:
-        with httpx.Client(timeout=15) as owned:
+        with httpx.Client(timeout=15, verify=ssl.create_default_context()) as owned:
             return check_release(current=current, client=owned)
     try:
         response = client.get(RELEASE_API, headers={"Accept": "application/vnd.github+json", "User-Agent": f"EchoMind/{VERSION}"})
@@ -124,7 +125,7 @@ def extract_package(archive: Path, destination: Path, version: str):
 
 def stage_update(release: Release, *, progress=lambda percent: None, client=None, directory=None) -> Path:
     if client is None:
-        with httpx.Client(timeout=httpx.Timeout(30, connect=15), follow_redirects=True) as owned:
+        with httpx.Client(timeout=httpx.Timeout(30, connect=15), follow_redirects=True, verify=ssl.create_default_context()) as owned:
             return stage_update(release, progress=progress, client=owned, directory=directory)
     base = Path(directory) if directory else Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "EchoMind" / "updates"
     base.mkdir(parents=True, exist_ok=True)

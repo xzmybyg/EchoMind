@@ -1,5 +1,6 @@
 param(
-    [string]$OutputDirectory = ''
+    [string]$OutputDirectory = '',
+    [switch]$IncludeComponents
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,7 +16,9 @@ $package = Join-Path $OutputDirectory 'EchoMind'
 if (Test-Path -LiteralPath $package) {
     throw "Package already exists: $package. Choose a fresh -OutputDirectory; existing packages are never deleted."
 }
-foreach ($required in @($python, (Join-Path $model 'model.bin'), (Join-Path $cuda 'cublas64_12.dll'))) {
+$inputs = @($python)
+if ($IncludeComponents) { $inputs += @((Join-Path $model 'model.bin'), (Join-Path $cuda 'cublas64_12.dll')) }
+foreach ($required in $inputs) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Required build input not found: $required" }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $repo 'services\transcription\echomind\gui.py'))) {
@@ -46,11 +49,13 @@ if ($LASTEXITCODE -ne 0) { throw 'Windowed executable build failed.' }
 & dotnet publish (Join-Path $repo 'native\audio-capture\EchoMind.Capture.csproj') -c Release -r win-x64 --self-contained true -o (Join-Path $package 'capture')
 if ($LASTEXITCODE -ne 0) { throw 'Audio capture publish failed.' }
 
-$modelOutput = Join-Path $package 'models\large-v3-turbo'
-$cudaOutput = Join-Path $package 'cuda'
-New-Item -ItemType Directory -Force -Path $modelOutput, $cudaOutput | Out-Null
-# Do not distribute incomplete download fragments or any local settings/secrets.
-Get-ChildItem -LiteralPath $model -File | Where-Object { $_.Extension -ne '.part' } | Copy-Item -Destination $modelOutput
-Get-ChildItem -LiteralPath $cuda -Filter '*.dll' -File | Copy-Item -Destination $cudaOutput
+if ($IncludeComponents) {
+    $modelOutput = Join-Path $package 'models\large-v3-turbo'
+    $cudaOutput = Join-Path $package 'cuda'
+    New-Item -ItemType Directory -Force -Path $modelOutput, $cudaOutput | Out-Null
+    # Do not distribute incomplete download fragments or any local settings/secrets.
+    Get-ChildItem -LiteralPath $model -File | Where-Object { $_.Extension -ne '.part' } | Copy-Item -Destination $modelOutput
+    Get-ChildItem -LiteralPath $cuda -Filter '*.dll' -File | Copy-Item -Destination $cudaOutput
+}
 Write-Host "Desktop package ready: $(Join-Path $package 'EchoMind.exe')"
-Write-Host 'Distribute the entire EchoMind folder; the exe needs its adjacent runtime and model folders.'
+Write-Host 'Distribute the entire EchoMind folder; the exe needs its adjacent runtime. Missing model/GPU components are downloaded on first launch.'

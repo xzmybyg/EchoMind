@@ -665,13 +665,110 @@ def test_save_failure_has_visible_feedback_and_retains_inputs(window, monkeypatc
     assert window.api_key.get() == "fake-local-test-key"
 
 
-def test_frozen_assets_are_relative_to_executable(monkeypatch, tmp_path):
+def test_frozen_assets_reuse_complete_portable_components(monkeypatch, tmp_path):
+    from echomind.components import MODEL, GPU
+    for item in (MODEL, GPU):
+        folder = tmp_path / item.folder
+        folder.mkdir(parents=True)
+        for name in item.files:
+            (folder / name).write_bytes(b"test")
     monkeypatch.setattr("sys.frozen", True, raising=False)
     monkeypatch.setattr("sys.executable", str(tmp_path / "EchoMind.exe"))
     capture, model, cuda = asset_paths()
     assert capture == tmp_path / "capture" / "EchoMind.Capture.exe"
     assert model == tmp_path / "models" / "large-v3-turbo"
     assert cuda == tmp_path / "cuda"
+
+
+@pytest.mark.parametrize("scaling", [1.0, 1.5, 2.0, 3.0])
+def test_component_dialog_actions_visible_and_escape_closes(window, scaling, monkeypatch, tmp_path):
+    previous = window.root.tk.call("tk", "scaling")
+    window.root.tk.call("tk", "scaling", scaling)
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setattr("echomind.components.cache_root", lambda: tmp_path / "components")
+    window.model_path = tmp_path / "missing-model"
+    window.cuda_dir = tmp_path / "missing-cuda"
+    window.root.deiconify()
+    try:
+        window.open_components()
+        dialog = window.component_dialog
+        window.root.update()
+        assert "2.29 GiB" in window.component_details.get()
+        assert str(window.component_download_button.cget("state")) == "normal"
+        for button in (window.component_close_button, window.component_download_button):
+            assert button.winfo_rooty() + button.winfo_height() <= dialog.winfo_rooty() + dialog.winfo_height()
+        window.device.set("CPU（较慢）")
+        window._component_state()
+        assert "约 1.39 GiB" in window.component_details.get()
+        assert "待下载：中文识别模型，" in window.component_details.get()
+        dialog.focus_force()
+        dialog.event_generate("<Escape>")
+        window.root.update()
+        assert window.component_dialog is None
+    finally:
+        window.root.tk.call("tk", "scaling", previous)
+
+
+def test_development_component_manager_never_downloads(window, monkeypatch):
+    monkeypatch.setattr("echomind.gui.install_components", lambda *args, **kwargs: pytest.fail("must not download in development"))
+    window.root.deiconify()
+    window.open_components()
+    assert "开发环境" in window.component_details.get()
+    assert str(window.component_download_button.cget("state")) == "disabled"
+    window.download_components()
+    assert not window.downloading_components
+    window.component_close_button.invoke()
+
+
+def test_frozen_missing_capture_opens_components_not_session(window, monkeypatch, tmp_path):
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setattr("echomind.gui.asset_paths", lambda: (tmp_path / "capture.exe", tmp_path / "model", tmp_path / "cuda"))
+    called = []
+    monkeypatch.setattr(window, "open_components", lambda: called.append("components"))
+    window.start_capture()
+    assert called == ["components"] and window.session is None
+
+
+def test_cancel_download_and_completion_restores_retry(window, monkeypatch, tmp_path):
+    import time
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setattr("echomind.gui.asset_paths", lambda: (tmp_path / "capture.exe", tmp_path / "model", tmp_path / "cuda"))
+    from echomind.components import DownloadCancelled
+    seen = []
+
+    def download(items, *, cancel, progress):
+        seen.extend(items)
+        assert cancel.wait(5)
+        raise DownloadCancelled("已取消，可重试")
+
+    monkeypatch.setattr("echomind.gui.install_components", download)
+    window.model_path, window.cuda_dir = tmp_path / "model", tmp_path / "cuda"
+    window.root.deiconify()
+    window.open_components()
+    window.component_download_button.invoke()
+    assert window.downloading_components
+    assert str(window.component_device_combo.cget("state")) == "disabled"
+    window.component_close_button.invoke()
+    deadline = time.monotonic() + 5
+    while window.downloading_components and time.monotonic() < deadline:
+        window.root.update()
+        time.sleep(0.01)
+    assert not window.downloading_components
+    assert len(seen) == 2
+    assert window.component_notice.get() == "已取消，可重试"
+    assert str(window.component_download_button.cget("state")) == "normal"
+    window.component_close_button.invoke()
+
+
+def test_first_run_only_prompts_when_components_missing(window, monkeypatch, tmp_path):
+    called = []
+    monkeypatch.setattr(window, "open_components", lambda: called.append(True))
+    window.model_path, window.cuda_dir = tmp_path / "model", tmp_path / "cuda"
+    window._first_run_components()
+    assert called == [True]
+    monkeypatch.setattr("echomind.gui.missing", lambda *args: [])
+    window._first_run_components()
+    assert called == [True]
 
 
 def test_secrets_are_masked_by_default_and_clear_on_exit(window):

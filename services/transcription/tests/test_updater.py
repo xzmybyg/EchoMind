@@ -54,7 +54,7 @@ def test_invalid_or_preview_versions_rejected(invalid):
 
 def test_release_check_returns_new_asset_and_notes():
     with client_for(asset_payload()) as client:
-        release = check_release(client=client)
+        release = check_release(current="0.1.1", client=client)
     assert release.version == "0.1.2" and release.notes == "修复识别问题"
     assert release.sha256 == "a" * 64
 
@@ -76,7 +76,7 @@ def test_github_failures_not_reported_as_up_to_date(status):
                                      {"browser_download_url": "https://github.com/other/repo/releases/download/v0.1.2/file.zip"}])
 def test_untrusted_incomplete_assets_rejected(overrides):
     with client_for(asset_payload(**overrides)) as client, pytest.raises(UpdateError):
-        check_release(client=client)
+        check_release(current="0.1.1", client=client)
 
 
 def test_timeout_wrapped():

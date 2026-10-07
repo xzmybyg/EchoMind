@@ -16,6 +16,8 @@ from tkinter import font as tkfont
 
 from .cli import meeting_processes
 from .desktop_session import DesktopSession, SessionConfig
+from .components import (ComponentError, install_components,
+                         missing, resolve_paths)
 from .settings import SettingsError, config_path, load_settings, save_settings
 from .screenshot import ScreenshotError, clipboard_has_image, recognize_clipboard, recognize_screenshot
 from .shortcuts import DEFAULT_SHORTCUTS, validate_shortcuts
@@ -47,7 +49,8 @@ class QuestionRecord:
 def asset_paths() -> tuple[Path, Path, Path]:
     if getattr(sys, "frozen", False):
         root = Path(sys.executable).resolve().parent
-        return root / "capture" / "EchoMind.Capture.exe", root / "models" / "large-v3-turbo", root / "cuda"
+        model, cuda = resolve_paths(root)
+        return root / "capture" / "EchoMind.Capture.exe", model, cuda
     root = Path(__file__).resolve().parents[3]
     return (root / "native/audio-capture/bin/Release/net9.0/EchoMind.Capture.exe",
             root / ".models/large-v3-turbo", root / ".runtime/cuda12")
@@ -116,6 +119,12 @@ class EchoMindWindow:
         self._shortcut_bindings = []
         self.settings_dialog = None
         self.settings_expanded = False
+        self.component_dialog = None
+        self.downloading_components = False
+        self.component_cancel = threading.Event()
+        self.component_notice = tk.StringVar()
+        self.component_details = tk.StringVar()
+        self.component_percent = tk.DoubleVar(value=0)
         self.update_dialog = None
         self.checking_updates = False
         self.updating = False
@@ -133,6 +142,7 @@ class EchoMindWindow:
         self._poll = self.root.after(60, self._drain)
         self._refresh = self.root.after(150, lambda: self.refresh() if self.source.get() == "腾讯会议" else None)
         self._update_timer = self.root.after(2500, lambda: self.check_updates(automatic=True)) if getattr(sys, "frozen", False) else None
+        self._component_timer = self.root.after(500, self._first_run_components) if getattr(sys, "frozen", False) else None
 
     def _build(self):
         self.root.title("EchoMind · 中文会议助手")
@@ -272,6 +282,9 @@ class EchoMindWindow:
         self.update_menu_button = ttk.Button(self.settings_menu, text="检查更新", command=self.check_updates)
         self.update_menu_button.pack(fill="x", pady=(8, 0))
         self.form_controls.append((self.update_menu_button, "normal"))
+        self.component_menu_button = ttk.Button(self.settings_menu, text="组件管理", command=self.open_components)
+        self.component_menu_button.pack(fill="x", pady=(8, 0))
+        self.form_controls.append((self.component_menu_button, "normal"))
         self.settings_button = ttk.Button(consent_footer, text="设置  +", style="Primary.TButton", command=self.toggle_settings)
         self.settings_button.pack(fill="x", pady=(12, 0))
         self.form_controls.append((self.settings_button, "normal"))
@@ -543,7 +556,113 @@ class EchoMindWindow:
             return
         self._edit_question(self.question_records[selected[0]].question)
 
+    def _first_run_components(self):
+        if self.destroyed or self.closing:
+            return
+        if missing(self.model_path, self.cuda_dir, DEVICE_MODES[self.device.get()]):
+            if self.root.grab_current() is not None:
+                self._component_timer = self.root.after(500, self._first_run_components)
+            else:
+                self.open_components()
+
+    def _component_state(self):
+        items = missing(self.model_path, self.cuda_dir, DEVICE_MODES[self.device.get()])
+        details = ("CPU 只需模型；GPU 还需 CUDA 组件及支持 CUDA 的 NVIDIA 显卡和驱动。\n"
+                   "下载来自 EchoMind GitHub Release，校验 SHA-256 后安装；不上传音频、字幕或密钥。\n"
+                   f"模型：{self.model_path}\nGPU：{self.cuda_dir}")
+        if not getattr(sys, "frozen", False):
+            details += "\n开发环境复用 .models 与 .runtime/cuda12，不自动联网下载。"
+        elif items:
+            size = sum(item.size for item in items) / 1024**3
+            details += f"\n待下载：{'、'.join(item.name for item in items)}，约 {size:.2f} GiB；缓存升级后保留。"
+        self.component_details.set(details)
+        if not self.downloading_components:
+            self.component_notice.set("需要准备语音组件；可稍后下载，先使用文字/截图回答。" if items else "语音组件已就绪，可关闭窗口开始采集。")
+        if self.component_dialog is not None:
+            self.component_download_button.configure(state="normal" if items and not self.downloading_components and getattr(sys, "frozen", False) else "disabled")
+            self.component_device_combo.configure(state="disabled" if self.downloading_components else "readonly")
+            self.component_close_button.configure(text="取消下载" if self.downloading_components else "关闭")
+
+    def open_components(self):
+        if self.component_dialog is not None and self.component_dialog.winfo_exists():
+            self.component_dialog.lift()
+            return
+        if self.root.grab_current() is not None or self.updating or (self.session and self.session.is_running):
+            return
+        dialog = tk.Toplevel(self.root)
+        self.component_dialog = dialog
+        dialog.title("设置 · 语音组件 · EchoMind")
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=24, style="Card.TFrame")
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
+        ttk.Label(frame, text="准备语音识别组件", style="Card.TLabel", font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 16))
+        row = ttk.Frame(frame, style="Card.TFrame")
+        row.grid(row=1, column=0, sticky="ew", pady=(0, 16))
+        ttk.Label(row, text="识别设备", style="Card.TLabel").pack(side="left", padx=(0, 12))
+        self.component_device_combo = ttk.Combobox(row, textvariable=self.device, values=list(DEVICE_MODES), state="readonly", width=16)
+        self.component_device_combo.pack(side="left")
+        self.component_device_combo.bind("<<ComboboxSelected>>", lambda _: self._component_state())
+        notice = ttk.Label(frame, textvariable=self.component_notice, style="Card.TLabel", wraplength=540)
+        notice.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        details = ttk.Label(frame, textvariable=self.component_details, style="Card.TLabel", foreground=COLORS["muted"], wraplength=540, justify="left")
+        details.grid(row=3, column=0, sticky="new", pady=(0, 16))
+        ttk.Progressbar(frame, variable=self.component_percent, maximum=100).grid(row=4, column=0, sticky="ew", pady=(0, 16))
+        actions = ttk.Frame(frame, style="Card.TFrame")
+        actions.grid(row=5, column=0, sticky="ew")
+        self.component_download_button = ttk.Button(actions, text="下载并准备", style="Primary.TButton", command=self.download_components)
+        self.component_download_button.pack(side="right")
+
+        def cancel():
+            if self.downloading_components:
+                self.component_cancel.set()
+                self.component_notice.set("正在取消，请稍候；已下载部分保留。")
+                return
+            self.component_dialog = None
+            dialog.destroy()
+            self.settings_button.focus_set()
+
+        self.component_close_button = ttk.Button(actions, text="稍后", command=cancel)
+        self.component_close_button.pack(side="right", padx=(0, 8))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Escape>", lambda _: cancel() or "break")
+        frame.bind("<Configure>", lambda e: [label.configure(wraplength=max(240, e.width - 48)) for label in (notice, details)])
+        self._component_state()
+        dialog.update_idletasks()
+        dialog.minsize(max(540, actions.winfo_reqwidth() + 48), frame.winfo_reqheight())
+        dialog.geometry(f"640x{max(420, frame.winfo_reqheight())}")
+        dialog.wait_visibility()
+        dialog.grab_set()
+        self.component_download_button.focus_set()
+
+    def download_components(self):
+        if self.downloading_components or self.updating or not getattr(sys, "frozen", False):
+            return
+        items = missing(self.model_path, self.cuda_dir, DEVICE_MODES[self.device.get()])
+        if not items:
+            return
+        self.downloading_components = True
+        self.component_cancel = threading.Event()
+        cancel = self.component_cancel
+        self.component_percent.set(0)
+        self.component_notice.set("正在准备下载…")
+        self._component_state()
+
+        def worker():
+            try:
+                install_components(items, cancel=cancel, progress=lambda text, percent: self.events.put((None, "component_progress", (text, percent))))
+            except ComponentError as exc:
+                self.events.put((None, "component_finished", str(exc)))
+            except Exception:
+                self.events.put((None, "component_finished", "组件准备失败，请稍后重试。"))
+            else:
+                self.events.put((None, "component_finished", "语音组件已准备完成，可开始采集。"))
+        threading.Thread(target=worker, name="echomind-components", daemon=True).start()
+
     def _open_update_dialog(self):
+        if self.component_dialog is not None:
+            return
         if self.update_dialog is not None and self.update_dialog.winfo_exists():
             self.update_dialog.lift()
             return
@@ -598,7 +717,7 @@ class EchoMindWindow:
             self.install_update_button.configure(state="normal" if self.available_release and not self.checking_updates and not self.updating and getattr(sys, "frozen", False) else "disabled")
 
     def check_updates(self, automatic=False):
-        if self.destroyed or self.closing or self.updating:
+        if self.destroyed or self.closing or self.updating or self.downloading_components:
             return
         if not automatic:
             self._open_update_dialog()
@@ -619,7 +738,7 @@ class EchoMindWindow:
         threading.Thread(target=worker, daemon=True).start()
 
     def install_update(self):
-        if not self.available_release or self.updating or self.checking_updates:
+        if not self.available_release or self.updating or self.checking_updates or self.downloading_components:
             return
         if not getattr(sys, "frozen", False):
             self.update_notice.set("源码运行不支持替换，请使用打包后的 EXE。")
@@ -917,6 +1036,14 @@ class EchoMindWindow:
     def _start(self, question=None):
         if self.session and self.session.is_running:
             return
+        if self.downloading_components:
+            self.error.set("请等待组件准备完成，或取消下载后再运行。")
+            return
+        if question is None and getattr(sys, "frozen", False):
+            self.capture_exe, self.model_path, self.cuda_dir = asset_paths()
+            if missing(self.model_path, self.cuda_dir, DEVICE_MODES[self.device.get()]):
+                self.open_components()
+                return
         self.error.set("")
         try:
             if question is not None and not question.strip():
@@ -980,6 +1107,20 @@ class EchoMindWindow:
             self.stop_button.configure(state="disabled")
 
     def _handle(self, kind, payload):
+        if kind.startswith("component_"):
+            if self.destroyed:
+                return
+            if kind == "component_progress":
+                self.component_notice.set(payload[0])
+                self.component_percent.set(payload[1])
+            elif kind == "component_finished":
+                self.downloading_components = False
+                self.capture_exe, self.model_path, self.cuda_dir = asset_paths()
+                self._component_state()
+                self.component_notice.set(payload)
+                if self.closing:
+                    self._destroy()
+            return
         if kind.startswith("update_"):
             if self.destroyed:
                 return
@@ -989,7 +1130,7 @@ class EchoMindWindow:
                 self.available_release = release
                 self.update_notice.set(f"发现新版 {release.version} · 当前 {VERSION}" if release else f"当前 {VERSION} 已是最新版本。")
                 self.update_notes.set((release.notes[:1200] + "\n\n更新会保留模型、CUDA 和本机配置。") if release else "无需更新。")
-                if release and automatic and self.settings_dialog is None and self.update_dialog is None and not self.closing:
+                if release and automatic and self.root.grab_current() is None and self.settings_dialog is None and self.update_dialog is None and not self.closing:
                     self._open_update_dialog()
             elif kind == "update_error":
                 self.checking_updates = False
@@ -1126,6 +1267,11 @@ class EchoMindWindow:
             return
         if self.closing:
             return
+        if self.downloading_components:
+            self.closing = True
+            self.component_cancel.set()
+            self.component_notice.set("正在取消下载并退出…")
+            return
         if self.session and self.session.is_running:
             if not messagebox.askyesno("退出 EchoMind", "当前正在运行。停止采集并退出？", parent=self.root):
                 return
@@ -1135,11 +1281,14 @@ class EchoMindWindow:
             self._destroy()
 
     def _destroy(self):
+        self.component_cancel.set()
         self.destroyed = True
         self.root.after_cancel(self._poll)
         self.root.after_cancel(self._refresh)
         if self._update_timer is not None:
             self.root.after_cancel(self._update_timer)
+        if self._component_timer is not None:
+            self.root.after_cancel(self._component_timer)
         self.api_key.set("")
         self.jev_key.set("")
         self.question_records.clear()
