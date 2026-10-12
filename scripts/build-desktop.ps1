@@ -37,8 +37,10 @@ $arguments = @(
     '--collect-all', 'av', '--collect-all', 'tokenizers',
     '--collect-all', 'sounddevice', '--collect-all', '_sounddevice_data',
     '--collect-all', 'opencc',
+    '--collect-all', 'sherpa_onnx',
     '--add-data', ((Join-Path $repo 'services\transcription\echomind\windows_ocr.ps1') + ';echomind'),
     '--add-data', ((Join-Path $repo 'services\transcription\echomind\windows_update.ps1') + ';echomind'),
+    '--add-data', ((Join-Path $repo 'services\transcription\echomind\qwen_worker.py') + ';echomind'),
     '--copy-metadata', 'faster-whisper', '--copy-metadata', 'ctranslate2',
     '--copy-metadata', 'av', '--copy-metadata', 'tokenizers',
     (Join-Path $PSScriptRoot 'desktop-entry.pyw')

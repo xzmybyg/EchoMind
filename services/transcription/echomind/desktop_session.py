@@ -1,6 +1,7 @@
 """Threaded desktop session; credentials stay in the caller's memory."""
 
 from dataclasses import dataclass, field
+import math
 import os
 from pathlib import Path
 import threading
@@ -10,11 +11,15 @@ from collections.abc import Callable
 import httpx
 
 from . import cli
+from .asr import DEFAULT_HOTWORDS
+from .asr_backends import ENGINE_LABELS, validate_model
+from .qwen_asr import QwenASRError, QwenTranscriber, runtime_python
 from .microphone import MicrophoneError, run_microphone
 from .copilot import Copilot
 from .intent import JevQuestionGate
 from .llm import DemoProvider, OpenAICompatibleProvider
 from .repair import OpenAICompatibleQuestionReviser
+from .tencent_asr import TencentConfig, TencentTranscriber, TencentASRError, signed_url
 
 
 @dataclass(frozen=True)
@@ -26,11 +31,15 @@ class SessionConfig:
     device: str = "cuda"
     answer_mode: str = "off"
     question_gate: str = "rules"
+    question_threshold: float = 0.85
     api_base_url: str = "https://api.deepseek.com"
     api_model: str = "deepseek-flash"
     api_key: str = field(default="", repr=False)
     jev_key: str = field(default="", repr=False)
     microphone: bool = False
+    asr_hotwords: str = DEFAULT_HOTWORDS
+    asr_engine: str = "whisper"
+    tencent: TencentConfig = field(default_factory=TencentConfig)
 
 
 class DesktopSession:
@@ -54,8 +63,12 @@ class DesktopSession:
             raise ValueError("回答模式无效")
         if config.question_gate not in ("rules", "jev"):
             raise ValueError("问题判断模式无效")
+        if isinstance(config.question_threshold, bool) or not isinstance(config.question_threshold, (int, float)) or not math.isfinite(config.question_threshold) or not 0 <= config.question_threshold <= 1:
+            raise ValueError("Jev 触发阈值必须为 0–100%")
         if config.device not in ("cuda", "cpu"):
             raise ValueError("识别设备无效")
+        if config.asr_engine not in ENGINE_LABELS:
+            raise ValueError("识别引擎无效")
         if config.answer_mode == "live":
             if not config.api_key.strip():
                 raise ValueError("请填写回答模型 API Key")
@@ -78,13 +91,21 @@ class DesktopSession:
             if config.answer_mode == "off":
                 raise ValueError("测试回答需要演练或在线回答模式")
         else:
+            if len(config.asr_hotwords) > 500:
+                raise ValueError("技术热词请控制在 500 字以内，仅填写短词")
             if not config.microphone and config.pid <= 0:
                 raise ValueError("请先选择腾讯会议进程")
             if not config.microphone and not config.capture_exe.is_file():
                 raise ValueError("未找到会议采集程序，请检查程序文件夹")
-            if not (config.model_path / "model.bin").is_file():
+            if config.asr_engine == "tencent":
+                signed_url(config.tencent, config.asr_hotwords)  # Validate without connecting.
+            elif config.asr_engine != "whisper":
+                validate_model(config.model_path, config.asr_engine)
+                if config.asr_engine == "qwen3-asr-1.7b":
+                    runtime_python(config.model_path)
+            elif not (config.model_path / "model.bin").is_file():
                 raise ValueError("未找到语音识别模型，请检查模型文件夹")
-            if config.device == "cuda" and not (config.cuda_dir / "cublas64_12.dll").is_file():
+            if config.asr_engine == "whisper" and config.device == "cuda" and not (config.cuda_dir / "cublas64_12.dll").is_file():
                 raise ValueError("未找到 GPU 运行库，请检查 cuda 文件夹或改用 CPU")
 
     def start(self, question: str | None = None) -> None:
@@ -121,6 +142,8 @@ class DesktopSession:
         dll_handle = None
         old_path = None
         config = self.config
+        cloud = None
+        local_backend = None
         def on_answer(event):
             self._on_event("answer", event)
 
@@ -136,7 +159,8 @@ class DesktopSession:
                 reviser = OpenAICompatibleQuestionReviser(
                     config.api_base_url.strip(), config.api_model.strip(), config.api_key.strip(),
                 ) if config.answer_mode == "live" else None
-                copilot = Copilot(provider, on_answer, question_gate=gate, question_reviser=reviser)
+                copilot = Copilot(provider, on_answer, question_gate=gate, question_reviser=reviser,
+                                  question_threshold=config.question_threshold)
                 if question is None:
                     with self._lock:
                         if not self._stop.is_set():
@@ -152,25 +176,50 @@ class DesktopSession:
                         self._on_event("error", "回答测试超时，已停止生成")
                         break
             else:
-                if config.device == "cuda":
+                if config.asr_engine == "tencent":
+                    cloud = TencentTranscriber(config.tencent, hotwords=config.asr_hotwords.strip(), stop_event=self._stop)
+                    asr_options = dict(engine="tencent", cloud_transcriber=cloud)
+                else:
+                    from .vad import SpeechVAD
+                    asr_options = dict(engine=config.asr_engine, vad=SpeechVAD(), end_silence_ms=600,
+                                       hotwords=config.asr_hotwords.strip() or None,
+                                       retry_low_confidence=True, context_window_ms=15000)
+                if config.asr_engine == "qwen3-asr-1.7b":
+                    self._on_event("status", "正在加载 Qwen3-ASR-1.7B（本地 GPU）…")
+                    local_backend = QwenTranscriber(model_size=str(config.model_path), device="cuda",
+                                                   stop_event=self._stop, **{k: v for k, v in asr_options.items() if k != "engine"})
+                    asr_options = dict(engine=config.asr_engine, local_transcriber=local_backend)
+                device = "cuda" if config.asr_engine == "qwen3-asr-1.7b" else config.device if config.asr_engine == "whisper" else "cpu"
+                if device == "cuda" and config.asr_engine == "whisper":
                     old_path = os.environ.get("PATH", "")
                     os.environ["PATH"] = str(config.cuda_dir) + os.pathsep + old_path
                     if os.name == "nt":
                         dll_handle = os.add_dll_directory(str(config.cuda_dir))
-                callbacks = dict(stop_event=self._stop,
+                callbacks = dict(stop_event=self._stop, asr_options=asr_options,
                                  on_transcript=lambda event: self._on_event("transcript", event),
                                  on_status=lambda message: self._on_event("status", message))
-                compute = "int8_float16" if config.device == "cuda" else "int8"
+                compute = "int8_float16" if device == "cuda" else "int8"
                 if config.microphone:
-                    run_microphone(str(config.model_path), config.device, compute, copilot, **callbacks)
+                    run_microphone(str(config.model_path), device, compute, copilot, **callbacks)
                 else:
-                    cli.run(config.pid, config.capture_exe, str(config.model_path), config.device, compute, copilot, **callbacks)
-        except MicrophoneError as error:
-            self._on_event("error", str(error))
+                    cli.run(config.pid, config.capture_exe, str(config.model_path), device, compute, copilot, **callbacks)
+                if cloud is not None:
+                    for event in cloud.flush():
+                        self._on_event("transcript", event)
+                        # Stop ends answer generation too; only display the trailing subtitle.
+                        if copilot is not None and not self._stop.is_set() and event.kind != "rejected":
+                            copilot.submit_transcript(event.text, event.timestamp_ms, final=event.kind == "final", suspect=event.suspect)
+        except (MicrophoneError, TencentASRError, QwenASRError) as error:
+            if not self._stop.is_set():
+                self._on_event("error", str(error))
         except Exception as error:
             # Never show exception strings, remote bodies or credentials in the UI.
             self._on_event("error", f"{type(error).__name__}：会话未能运行，请检查模型、采集程序和配置")
         finally:
+            if local_backend is not None:
+                local_backend.close()
+            if cloud is not None:
+                cloud.close()
             with self._lock:
                 self._copilot = None
             try:

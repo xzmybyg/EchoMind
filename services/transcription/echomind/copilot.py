@@ -214,9 +214,9 @@ class Copilot:
             )
             if self._closed or candidate_id != self._candidate_id:
                 return
-            local_uncertainty = suspect and self._question_reviser is None
-            if result.needs_confirmation or local_uncertainty or normalize_question(result.corrected) != normalize_question(text):
-                reason = "语音识别置信度偏低，请核对原话" if local_uncertainty and not result.needs_confirmation else result.reason
+            # A text-only review cannot override uncertainty in the source audio.
+            if result.needs_confirmation or suspect or normalize_question(result.corrected) != normalize_question(text):
+                reason = "语音识别置信度偏低，请核对原话" if suspect and not result.needs_confirmation else result.reason
                 self._emit(AnswerEvent("needs_confirmation", candidate_id, text, result.corrected, reason=reason))
                 return
             if already_judged:

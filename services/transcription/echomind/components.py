@@ -63,10 +63,18 @@ def ready(folder: Path, component: Component) -> bool:
 
 
 def resolve_paths(app_root: Path, *, directory=None) -> tuple[Path, Path]:
-    """Reuse legacy portable installations before the persistent user cache."""
+    """Reuse portable/cache components, then a nearby EchoMind development checkout."""
     cache = Path(directory) if directory is not None else cache_root()
-    return tuple(app_root / item.folder if ready(app_root / item.folder, item) else cache / item.folder
-                 for item in (MODEL, GPU))
+    app_root = Path(app_root).resolve()
+    project = next((path for path in (app_root, *app_root.parents[:4])
+                    if (path / "services/transcription/pyproject.toml").is_file()), None)
+    paths = []
+    for item, development_folder in ((MODEL, ".models/large-v3-turbo"), (GPU, ".runtime/cuda12")):
+        candidates = [app_root / item.folder, cache / item.folder]
+        if project is not None:
+            candidates.append(project / development_folder)
+        paths.append(next((path for path in candidates if ready(path, item)), cache / item.folder))
+    return tuple(paths)
 
 
 def missing(model: Path, cuda: Path, device: str) -> list[Component]:

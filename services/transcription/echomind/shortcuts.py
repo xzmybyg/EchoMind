@@ -2,7 +2,7 @@
 
 import re
 
-DEFAULT_SHORTCUTS = {"shortcut_submit": "Enter", "shortcut_start": "Ctrl+R", "shortcut_stop": "Ctrl+S"}
+DEFAULT_SHORTCUTS = {"shortcut_submit": "Enter", "shortcut_start": "Ctrl+R", "shortcut_stop": "Ctrl+S", "shortcut_follow": "Ctrl+F"}
 
 
 def shortcut_sequence(value: str) -> str:
@@ -25,11 +25,11 @@ def shortcut_sequence(value: str) -> str:
 def validate_shortcuts(values) -> dict[str, str]:
     sequences = {key: shortcut_sequence(values.get(key, default)) for key, default in DEFAULT_SHORTCUTS.items()}
     if len(set(sequences.values())) != len(sequences):
-        raise ValueError("提交、开始、停止的快捷键不能重复。")
+        raise ValueError("提交、开始、停止、跟随的快捷键不能重复。")
     if set(sequences.values()) & {f"<Control-{key}>" for key in "acvxzy"} or "<Alt-F4>" in sequences.values():
         raise ValueError("请保留复制、粘贴、剪切、全选、撤销和关闭窗口快捷键，选择其他键位。")
-    if any(sequences[key] == "<Control-Return>" for key in ("shortcut_start", "shortcut_stop")):
+    if any(sequences[key] == "<Control-Return>" for key in ("shortcut_start", "shortcut_stop", "shortcut_follow")):
         raise ValueError("Ctrl+Enter 已用于字幕加入问题，请选择其他快捷键。")
-    if any(sequences[key] in ("<Return>", "<Shift-Return>") for key in ("shortcut_start", "shortcut_stop")):
-        raise ValueError("开始和停止请使用组合键或功能键，避免输入时误触。")
+    if any(sequences[key] in ("<Return>", "<Shift-Return>") for key in ("shortcut_start", "shortcut_stop", "shortcut_follow")):
+        raise ValueError("开始、停止和跟随请使用组合键或功能键，避免输入时误触。")
     return sequences

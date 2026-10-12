@@ -1,0 +1,22 @@
+{
+  "description": "Deterministic local Windows TTS regression corpus; references are authored before ASR. Not a human speech accuracy benchmark.",
+  "cases": [
+    {"id":"hooks", "parts":["讲解一下 React 的 Hooks。"], "terms":["React","Hooks"], "question":true},
+    {"id":"fiber", "parts":["请解释一下 React Fiber 的工作原理。"], "terms":["React","Fiber"], "question":true},
+    {"id":"promise", "parts":["ES6 的 Promise 有了解吗？"], "terms":["ES6","Promise"], "question":true},
+    {"id":"vue", "parts":["React 和 Vue 有什么区别？"], "terms":["React","Vue"], "question":true},
+    {"id":"redis", "parts":["为什么 Redis 比直接查询数据库快？"], "terms":["Redis"], "question":true},
+    {"id":"tcp", "parts":["请解释 TCP 的三次握手和四次挥手。"], "terms":["TCP"], "question":true},
+    {"id":"pause_request", "parts":["然后再讲解一下",1400,"ES6 的 Promise。"], "terms":["ES6","Promise"], "question":true},
+    {"id":"pause_subject", "parts":["React 和",1100,"Vue 有什么区别？"], "terms":["React","Vue"], "question":true},
+    {"id":"design", "parts":["设计一个前端灰度发布方案",1300,"支持按用户编号、设备类型和地理位置逐步放量新功能。"], "terms":["灰度发布"], "question":true},
+    {"id":"quiet_hooks", "parts":["请介绍一下 React Hooks 的使用规则。"], "gain":0.08, "terms":["React","Hooks"], "question":true},
+    {"id":"noisy_fiber", "parts":["讲解一下 React Fiber 如何实现任务调度。"], "snr_db":15, "terms":["React","Fiber"], "question":true},
+    {"id":"arithmetic", "parts":["一百二十三乘以四百五十六等于多少？"], "reference":"123乘以456等于多少？", "question":true},
+    {"id":"statement", "parts":["我来解释一下这个项目，今天先把会议记录整理好。"], "question":false},
+    {"id":"thanks", "parts":["好的，谢谢大家。"], "question":false},
+    {"id":"silence", "duration_ms":10000, "question":false},
+    {"id":"background_noise", "duration_ms":10000, "noise_rms":0.0012, "question":false},
+    {"id":"background_hum", "duration_ms":10000, "hum_amplitude":0.003, "question":false}
+  ]
+}

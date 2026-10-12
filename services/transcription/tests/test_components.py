@@ -48,6 +48,40 @@ def test_incomplete_component_is_not_ready(tmp_path):
     assert not ready(tmp_path, MODEL)
 
 
+def test_packaged_app_reuses_nearby_development_components_without_copy(tmp_path):
+    project = tmp_path / "EchoMind"
+    marker = project / "services/transcription/pyproject.toml"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("[project]", encoding="utf-8")
+    model, gpu = project / ".models/large-v3-turbo", project / ".runtime/cuda12"
+    populate(model, MODEL)
+    populate(gpu, GPU)
+    app, cache = project / "dist/light/EchoMind", tmp_path / "cache"
+    paths = resolve_paths(app, directory=cache)
+    assert paths == (model, gpu)
+    assert missing(*paths, "cuda") == []
+    assert not cache.exists()
+    populate(cache / GPU.folder, GPU)
+    assert resolve_paths(app, directory=cache) == (model, cache / GPU.folder)
+    populate(app / MODEL.folder, MODEL)
+    assert resolve_paths(app, directory=cache)[0] == app / MODEL.folder
+
+
+def test_development_fallback_requires_project_marker_and_complete_files(tmp_path):
+    project = tmp_path / "EchoMind"
+    app, cache = project / "dist/light/EchoMind", tmp_path / "cache"
+    model = project / ".models/large-v3-turbo"
+    populate(model, MODEL)
+    assert resolve_paths(app, directory=cache)[0] == cache / MODEL.folder
+    marker = project / "services/transcription/pyproject.toml"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("[project]", encoding="utf-8")
+    (model / "model.bin").write_bytes(b"")
+    assert resolve_paths(app, directory=cache)[0] == cache / MODEL.folder
+    populate(project / ".runtime/cuda12", GPU)
+    assert resolve_paths(app, directory=cache)[1] == project / ".runtime/cuda12"
+
+
 def test_download_install_and_skip_without_network(tmp_path):
     item, data = package()
     calls, progress = [], []

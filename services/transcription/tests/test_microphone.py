@@ -8,12 +8,20 @@ import numpy as np
 import pytest
 
 from echomind.asr import TranscriptEvent
-from echomind.microphone import MicrophoneError, run_microphone
+from echomind.microphone import MicrophoneError, input_quality, run_microphone
 
 
 def run(stopping, callback=lambda _: None, copilot=None):
     run_microphone("model", "cpu", "int8", copilot, stop_event=stopping,
                    on_transcript=callback, on_status=lambda _: None)
+
+
+@pytest.mark.parametrize("amplitude,expected", [(0, "未检测到"), (40, "输入较低"),
+                                               (1000, ""), (32767, "削波"), (-32768, "削波")])
+def test_input_quality_distinguishes_silence_weak_input_and_clipping(amplitude, expected):
+    level, message = input_quality(np.full(1600, amplitude, dtype="<i2").tobytes())
+    assert expected in message
+    assert level == pytest.approx(abs(amplitude) / 32768)
 
 
 @pytest.fixture
@@ -23,9 +31,10 @@ def model():
         yield factory.return_value
 
 
-def test_default_microphone_resamples_and_routes_final_to_answers(model):
+@pytest.mark.parametrize('kind', ['final', 'rejected'])
+def test_default_microphone_resamples_and_routes_final_to_answers(model, kind):
     stopping = threading.Event()
-    final = TranscriptEvent("final", "Redis为什么快", 1234, 1, suspect=True)
+    final = TranscriptEvent(kind, "Redis为什么快", 1234, 1, suspect=True)
     model.push_pcm.return_value = [final]
     copilot = Mock()
     closed = []
@@ -48,7 +57,10 @@ def test_default_microphone_resamples_and_routes_final_to_answers(model):
     assert received == [final]
     pcm = model.push_pcm.call_args.args[0]
     assert 3000 <= len(pcm) <= 3200 and len(pcm) % 2 == 0
-    copilot.submit_transcript.assert_called_once_with(final.text, final.timestamp_ms, final=True, suspect=True)
+    if kind == 'rejected':
+        copilot.submit_transcript.assert_not_called()
+    else:
+        copilot.submit_transcript.assert_called_once_with(final.text, final.timestamp_ms, final=True, suspect=True)
     assert closed == [True]
 
 

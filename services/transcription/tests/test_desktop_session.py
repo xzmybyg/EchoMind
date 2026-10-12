@@ -10,6 +10,31 @@ from echomind.desktop_session import DesktopSession, SessionConfig
 
 
 class DesktopSessionTests(unittest.TestCase):
+    def test_cloud_session_skips_models_vad_and_gpu_and_closes(self):
+        from echomind.tencent_asr import TencentConfig
+        config = replace(self.config, microphone=True, asr_engine="tencent",
+                         tencent=TencentConfig("123", "fake-id", "fake-key", consent=True))
+        events = []
+        with patch("echomind.desktop_session.TencentTranscriber") as factory, \
+             patch("echomind.desktop_session.run_microphone") as capture, \
+             patch("echomind.vad.SpeechVAD", side_effect=AssertionError("must not load VAD")), \
+             patch.object(Path, "is_file", return_value=False):
+            factory.return_value.flush.return_value = []
+            session = DesktopSession(config, lambda *event: events.append(event))
+            session.start()
+            self.assertTrue(session.wait(3))
+            self.assertIs(capture.call_args.kwargs["asr_options"]["cloud_transcriber"], factory.return_value)
+            factory.return_value.close.assert_called_once()
+            self.assertFalse(any(kind == "error" for kind, _ in events))
+
+    def test_cloud_consent_is_required_for_microphone_but_not_text_question(self):
+        from echomind.tencent_asr import TencentASRError
+        session = DesktopSession(replace(self.config, microphone=True, asr_engine="tencent"), lambda *_: None)
+        with self.assertRaisesRegex(TencentASRError, "同意"):
+            session.start()
+        session.start("React Hooks 原理")
+        self.assertTrue(session.wait(3))
+
     def setUp(self):
         self.config = SessionConfig(Path("missing-capture.exe"), Path("missing-model"), Path("missing-cuda"), answer_mode="demo")
 
@@ -22,6 +47,58 @@ class DesktopSessionTests(unittest.TestCase):
             capture.assert_not_called()
         self.assertEqual(events[-1], ("finished", None))
         self.assertIn("done", [payload.kind for kind, payload in events if kind == "answer"])
+
+    def test_question_threshold_changes_semantic_answer_trigger(self):
+        class Gate:
+            async def evaluate(self, *_):
+                return 0.8
+
+        class Provider:
+            async def stream_answer(self, *_):
+                yield "回答"
+
+        def capture(model, device, compute, copilot, **kwargs):
+            copilot.submit_transcript("缓存一致性展开聊聊", 11)
+            self.assertTrue(copilot.wait_idle(2))
+
+        for threshold, should_answer in ((0.65, True), (0.8, True), (0.85, False)):
+            with self.subTest(threshold=threshold):
+                events = []
+                config = replace(self.config, question_threshold=threshold, microphone=True, device="cpu",
+                                 answer_mode="live", question_gate="jev", api_key="fake-key", jev_key="fake-jev")
+                with patch.object(Path, "is_file", return_value=True), \
+                     patch("echomind.desktop_session.run_microphone", side_effect=capture), \
+                     patch("echomind.desktop_session.JevQuestionGate", return_value=Gate()), \
+                     patch("echomind.desktop_session.OpenAICompatibleProvider", return_value=Provider()):
+                    session = DesktopSession(config, lambda *event: events.append(event))
+                    session.start()
+                    self.assertTrue(session.wait(3))
+                self.assertFalse(any(kind == "error" for kind, _ in events))
+                self.assertEqual(any(kind == "answer" and event.kind == "done" for kind, event in events), should_answer)
+
+    def test_invalid_question_threshold_is_rejected_before_start(self):
+        for value in (-0.01, 1.01, float("nan"), float("inf"), True, "0.85", None):
+            with self.subTest(value=value):
+                session = DesktopSession(replace(self.config, question_threshold=value), lambda *_: None)
+                with self.assertRaisesRegex(ValueError, "阈值"):
+                    session.start("问题")
+                self.assertFalse(session.is_running)
+
+    def test_audio_session_uses_speech_gate_pause_hotwords_and_retry(self):
+        config = replace(self.config, microphone=True, device="cpu", asr_hotwords="React Fiber")
+        events = []
+        with patch.object(Path, "is_file", return_value=True), patch("echomind.desktop_session.run_microphone") as capture:
+            session = DesktopSession(config, lambda *event: events.append(event))
+            session.start()
+            self.assertTrue(session.wait(3))
+        from echomind.vad import SpeechVAD
+        options = capture.call_args.kwargs["asr_options"]
+        self.assertIsInstance(options["vad"], SpeechVAD)
+        self.assertEqual(options["end_silence_ms"], 600)
+        self.assertEqual(options["hotwords"], "React Fiber")
+        self.assertTrue(options["retry_low_confidence"])
+        self.assertEqual(options["context_window_ms"], 15000)
+        self.assertFalse(any(kind == "error" for kind, _ in events))
 
     def test_edited_topic_without_question_marker_generates_answer(self):
         events = []
@@ -196,6 +273,17 @@ class DesktopSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "识别模型"):
             session.start()
         self.assertFalse(session.is_running)
+
+    def test_experimental_engines_run_on_cpu_without_cuda(self):
+        for engine in ("sensevoice", "paraformer"):
+            config = replace(self.config, microphone=True, device="cuda", asr_engine=engine)
+            with patch.object(Path, "is_file", return_value=True), patch("echomind.desktop_session.os.add_dll_directory") as dll, patch("echomind.desktop_session.run_microphone") as capture:
+                session = DesktopSession(config, lambda *_: None)
+                session.start()
+                self.assertTrue(session.wait(3))
+            dll.assert_not_called()
+            self.assertEqual(capture.call_args.args[1:3], ("cpu", "int8"))
+            self.assertEqual(capture.call_args.kwargs["asr_options"]["engine"], engine)
 
     def test_microphone_errors_are_actionable(self):
         from echomind.microphone import MicrophoneError

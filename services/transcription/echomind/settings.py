@@ -5,18 +5,19 @@ from collections.abc import Mapping
 import ctypes
 from ctypes import wintypes
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
-from .shortcuts import DEFAULT_SHORTCUTS, validate_shortcuts
+from .shortcuts import DEFAULT_SHORTCUTS, shortcut_sequence, validate_shortcuts
 
 
 class SettingsError(RuntimeError):
     """A safe settings error suitable for display, without file contents."""
 
 
-_TEXT_FIELDS = ("api_base_url", "api_model", "answer_mode", "device", "source", *DEFAULT_SHORTCUTS)
-_SECRET_FIELDS = ("api_key", "jev_key")
+_TEXT_FIELDS = ("api_base_url", "api_model", "answer_mode", "device", "source", "follow_side", "asr_hotwords", "asr_model_path", "asr_engine", "tencent_app_id", "tencent_engine", *DEFAULT_SHORTCUTS)
+_SECRET_FIELDS = ("api_key", "jev_key", "tencent_secret_id", "tencent_secret_key")
 
 
 def config_path() -> Path:
@@ -62,26 +63,33 @@ def _unprotect_secret(value: str) -> str:
     return _dpapi(base64.b64decode(value, validate=True), decrypt=True).decode("utf-8")
 
 
-def _validate(settings: Mapping[str, str | bool]) -> dict[str, str | bool]:
-    allowed = {*_TEXT_FIELDS, *_SECRET_FIELDS, "jev_enabled"}
+def _validate(settings: Mapping[str, str | bool | float]) -> dict[str, str | bool | float]:
+    allowed = {*_TEXT_FIELDS, *_SECRET_FIELDS, "jev_enabled", "follow_enabled", "question_threshold"}
     if not isinstance(settings, Mapping) or set(settings) - allowed:
         raise ValueError("invalid settings fields")
     result = dict(settings)
     for key, value in result.items():
-        if key == "jev_enabled":
+        if key == "question_threshold":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError("invalid question threshold")
+        elif key in ("jev_enabled", "follow_enabled"):
             if not isinstance(value, bool):
                 raise ValueError("invalid setting type")
         elif not isinstance(value, str):
             raise ValueError("invalid setting type")
     for key, allowed_values in {"answer_mode": ("off", "demo", "live"), "device": ("cuda", "cpu"),
-                                "source": ("腾讯会议", "本机麦克风")}.items():
+                                "source": ("腾讯会议", "本机麦克风"), "follow_side": ("left", "right"),
+                                "asr_engine": ("whisper", "sensevoice", "paraformer", "qwen3-asr-1.7b", "tencent"),
+                                "tencent_engine": ("16k_zh_en", "16k_zh")}.items():
         if key in result and result[key] not in allowed_values:
             raise ValueError("invalid setting value")
+    if len(result.get("asr_hotwords", "")) > 500:
+        raise ValueError("技术热词请控制在 500 字以内，仅填写短词")
     validate_shortcuts(result)
     return result
 
 
-def load_settings(path: Path | None = None) -> dict[str, str | bool]:
+def load_settings(path: Path | None = None) -> dict[str, str | bool | float]:
     """Read saved settings; missing files return defaults, corrupt files are preserved."""
     target = Path(path) if path is not None else config_path()
     try:
@@ -101,6 +109,10 @@ def load_settings(path: Path | None = None) -> dict[str, str | bool]:
                     raise ValueError("invalid encrypted setting")
                 result[key] = _unprotect_secret(encrypted)
         result.update(document)
+        if "shortcut_follow" not in result:
+            used = {shortcut_sequence(result.get(key, default)) for key, default in DEFAULT_SHORTCUTS.items() if key != "shortcut_follow"}
+            if shortcut_sequence(DEFAULT_SHORTCUTS["shortcut_follow"]) in used:
+                result["shortcut_follow"] = next(value for value in ("Ctrl+Alt+F", "F10", "F11", "F12") if shortcut_sequence(value) not in used)
         return _validate(result)
     except FileNotFoundError:
         return {}
@@ -108,7 +120,7 @@ def load_settings(path: Path | None = None) -> dict[str, str | bool]:
         raise SettingsError("无法读取配置文件，文件可能损坏或不属于当前 Windows 用户；原文件未改动。") from None
 
 
-def save_settings(settings: Mapping[str, str | bool], path: Path | None = None) -> None:
+def save_settings(settings: Mapping[str, str | bool | float], path: Path | None = None) -> None:
     """Save explicitly, encrypting keys before writing any bytes to disk."""
     target = Path(path) if path is not None else config_path()
     temporary = None

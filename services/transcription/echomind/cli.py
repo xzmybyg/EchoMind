@@ -67,14 +67,14 @@ def choose_pid(processes: list[dict[str, object]]) -> int:
 
 def show_events(events: object, copilot=None) -> None:
     for event in events:
-        label = "实时" if event.kind == "partial" else "确定"
+        label = "已拦截" if event.kind == "rejected" else "实时" if event.kind == "partial" else "确定"
         receive_to_display_ms = max(0, int(time.monotonic() * 1000) - event.timestamp_ms)
         with OUTPUT_LOCK:
             print(
                 f"[{label}] {event.text}  ASR {event.latency_ms:.0f} ms / 接收后显示 {receive_to_display_ms} ms",
                 flush=True,
             )
-        if copilot is not None:
+        if copilot is not None and event.kind != "rejected":
             copilot.submit_transcript(event.text, event.timestamp_ms, final=event.kind == "final", suspect=event.suspect)
 
 
@@ -107,12 +107,12 @@ def show_answer(event) -> None:
 
 
 def run(pid: int, capture_exe: Path, model: str, device: str, compute_type: str, copilot=None,
-        *, stop_event=None, on_transcript=None, on_status=None) -> int:
+        *, stop_event=None, on_transcript=None, on_status=None, asr_options=None) -> int:
     if not capture_exe.is_file():
         raise RuntimeError(f"采集程序不存在：{capture_exe}。请先构建 native/audio-capture。")
-    from .asr import Transcriber
+    from .asr_backends import create_transcriber
 
-    transcriber = Transcriber(model_size=model, device=device, compute_type=compute_type)
+    transcriber = create_transcriber(model_size=model, device=device, compute_type=compute_type, **(asr_options or {}))
     stopping = stop_event if stop_event is not None else threading.Event()
     gui_mode = on_transcript is not None or on_status is not None
 
@@ -129,10 +129,11 @@ def run(pid: int, capture_exe: Path, model: str, device: str, compute_type: str,
             for event in events:
                 if on_transcript is not None:
                     on_transcript(event)
-                if copilot is not None:
+                if copilot is not None and event.kind != "rejected":
                     copilot.submit_transcript(event.text, event.timestamp_ms, final=event.kind == "final", suspect=event.suspect)
 
-    status("正在预热识别模型…")
+    cloud = (asr_options or {}).get("engine") == "tencent"
+    status("正在连接腾讯云识别…" if cloud else "正在预热识别模型…")
     transcriber.warm_up()
     if stopping.is_set():
         return 0
@@ -183,6 +184,8 @@ def run(pid: int, capture_exe: Path, model: str, device: str, compute_type: str,
             try:
                 item = chunks.get(timeout=0.1)
             except queue.Empty:
+                if cloud:
+                    publish(transcriber.poll())
                 continue
             if item is None:
                 break

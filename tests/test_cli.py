@@ -84,6 +84,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual(copilot.submit_transcript.call_args_list[1].kwargs, {"final": True, "suspect": True})
         copilot.wait_idle.assert_not_called()
 
+    def test_rejected_transcript_never_reaches_copilot(self):
+        from echomind.asr import TranscriptEvent
+        copilot = Mock()
+        with patch('sys.stdout', new_callable=io.StringIO) as output:
+            cli.show_events([TranscriptEvent('rejected', 'Vue JavaScript ' * 4, 1, 1, True)], copilot)
+        copilot.submit_transcript.assert_not_called()
+        self.assertIn('已拦截', output.getvalue())
+        self.assertNotIn('确定', output.getvalue())
+
     def test_suspect_question_prints_confirmation_instead_of_false_failure(self):
         with patch("sys.stdout", new_callable=io.StringIO) as output:
             self.assertEqual(cli.main(["--answers", "demo", "--text-question", "1加1等于进。"]), 0)
@@ -161,20 +170,22 @@ class CliTests(unittest.TestCase):
         child.poll.return_value = None
         child.wait.return_value = -1
         popen.return_value = child
-        event = SimpleNamespace(kind="final", text="Redis为什么快", timestamp_ms=1, latency_ms=1, suspect=False)
+        event = SimpleNamespace(kind="rejected", text="Vue JavaScript " * 4, timestamp_ms=1, latency_ms=1, suspect=True)
         transcriber.return_value.push_pcm.return_value = [event]
         stopping = threading.Event()
         transcripts = []
+        copilot = Mock()
 
         def on_transcript(value):
             transcripts.append(value)
             stopping.set()
 
         with patch("sys.stdout", new_callable=io.StringIO) as output:
-            self.assertEqual(cli.run(42, Path(__file__), "test", "cpu", "default", stop_event=stopping,
+            self.assertEqual(cli.run(42, Path(__file__), "test", "cpu", "default", copilot, stop_event=stopping,
                                      on_transcript=on_transcript, on_status=lambda _: None), 0)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(transcripts, [event])
+        copilot.submit_transcript.assert_not_called()
         child.terminate.assert_called_once()
         transcriber.return_value.flush.assert_not_called()
 

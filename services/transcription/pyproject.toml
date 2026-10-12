@@ -4,13 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "echomind-transcription"
-version = "0.1.2"
+version = "0.1.3"
 description = "EchoMind real-time Chinese captions MVP"
 requires-python = ">=3.11"
 dependencies = [
-    "faster-whisper>=1.1,<2",
+    # Streaming VAD uses this release's Silero v6 ONNX input/state contract.
+    "faster-whisper==1.2.1",
     "numpy>=1.24,<3",
     "httpx>=0.27,<1",
+    "websockets>=15,<16",
     "sounddevice>=0.5,<0.6",
     "opencc-python-reimplemented>=0.1.7,<0.2",
 ]
@@ -18,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
 desktop-build = ["pyinstaller>=6,<7"]
+asr-onnx = ["sherpa-onnx==1.13.3"]
 
 [tool.setuptools.packages.find]
 where = ["."]

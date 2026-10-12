@@ -37,6 +37,356 @@ def test_selects_main_process_not_crash_handler():
     assert preferred_pid([]) is None
 
 
+def test_qwen_option_selects_gpu_and_persists(window, monkeypatch):
+    from echomind.asr_backends import ENGINE_LABELS
+    from echomind.settings import load_settings
+    window.asr_engine.set(ENGINE_LABELS["qwen3-asr-1.7b"])
+    window._asr_engine_changed()
+    window.source.set("本机麦克风")
+    monkeypatch.setattr("echomind.gui.validate_model", lambda *_: None)
+    config = window._config()
+    assert config.asr_engine == "qwen3-asr-1.7b" and config.device == "cuda"
+    assert "不传热词" in window.asr_engine_hint.get()
+    assert window.save_config()
+    assert load_settings(window.settings_path)["asr_engine"] == "qwen3-asr-1.7b"
+
+
+def test_cloud_form_consent_and_model_bypass(window, monkeypatch):
+    from echomind.asr_backends import ENGINE_LABELS
+    from echomind.tencent_asr import TencentASRError
+    window.asr_engine.set(ENGINE_LABELS["tencent"])
+    window._asr_engine_changed()
+    assert window.cloud_asr_fields.grid_info()
+    assert not window.local_asr_fields.grid_info()
+    assert "上传音频" in window.caption_source.get()
+    window.source.set("本机麦克风")
+    monkeypatch.setattr("echomind.gui.validate_model", lambda *_: pytest.fail("cloud must not check local models"))
+    monkeypatch.setattr(window, "open_components", lambda: pytest.fail("cloud must not download models"))
+    window._first_run_components()
+    with pytest.raises(TencentASRError, match="同意"):
+        window._config()
+    for key, value in (("tencent_app_id", "123"), ("tencent_secret_id", "fake-id"), ("tencent_secret_key", "fake-key")):
+        window.tencent_fields[key].set(value)
+    window.cloud_consent.set(True)
+    config = window._config()
+    assert config.tencent.secret_key == "fake-key" and config.tencent.consent
+    assert config.device == "cpu"
+    assert window.save_config()
+    from echomind.settings import load_settings
+    saved = load_settings(window.settings_path)
+    assert saved["tencent_secret_key"] == "fake-key"
+    assert "consent" not in saved
+    assert "fake-key" not in window.settings_path.read_text(encoding="utf-8")
+    window.asr_engine.set(ENGINE_LABELS["whisper"])
+    window._asr_engine_changed()
+    assert not window.cloud_consent.get()
+    assert window.local_asr_fields.grid_info() and not window.cloud_asr_fields.grid_info()
+
+
+def test_speech_hotwords_and_model_directory_reach_session(window, tmp_path):
+    window.source.set("本机麦克风")
+    window.asr_hotwords.set("React Fiber, Promise")
+    window.asr_model_path.set(str(tmp_path))
+    for name in ("model.bin", "config.json", "tokenizer.json", "vocabulary.json"):
+        (tmp_path / name).touch()
+    config = window._config()
+    assert config.model_path == tmp_path
+    assert config.asr_hotwords == "React Fiber, Promise"
+    window.asr_model_path.set(str(tmp_path / "missing"))
+    with pytest.raises(ValueError, match="不完整"):
+        window._config()
+    window.asr_model_path.set("")
+    assert window._config().model_path == window.model_path
+
+
+@pytest.mark.parametrize("engine", ["sensevoice", "paraformer"])
+def test_engine_selection_clears_mismatched_path_and_routes_cpu(window, tmp_path, engine):
+    from echomind.asr_backends import ENGINE_LABELS, MODEL_FILES
+    window.source.set("本机麦克风")
+    window.asr_model_path.set("old-whisper-model")
+    window.asr_engine.set(ENGINE_LABELS[engine])
+    window._asr_engine_changed()
+    assert window.asr_model_path.get() == ""
+    assert "CPU" in window.asr_engine_hint.get()
+    for name in MODEL_FILES[engine]:
+        (tmp_path / name).write_bytes(b"fixture")
+    window.asr_model_path.set(str(tmp_path))
+    config = window._config()
+    assert config.asr_engine == engine and config.device == "cpu"
+    assert config.model_path == tmp_path
+    assert window.save_config()
+    from echomind.settings import load_settings
+    assert load_settings(window.settings_path)["asr_engine"] == engine
+
+
+def test_experimental_first_launch_does_not_download_whisper(window, monkeypatch):
+    from echomind.asr_backends import ENGINE_LABELS
+    window.asr_engine.set(ENGINE_LABELS["sensevoice"])
+    monkeypatch.setattr(window, "open_components", lambda: pytest.fail("must not download Whisper for SenseVoice"))
+    window._first_run_components()
+    window.asr_model_path.set("D:/missing-sensevoice-model")
+    window.mode.set("离线演练")
+    assert window._config(text_test=True).asr_engine == "sensevoice"
+    window.source.set("本机麦克风")
+    with pytest.raises(ValueError, match="不完整"):
+        window._config()
+
+
+def test_audio_revision_displays_original_without_overwriting_subtitle(window):
+    window._handle("transcript", SimpleNamespace(kind="final", text="React Fiber 原理", original_text="React Fibr 原理", suspect=False))
+    captions = window.caption_text.get("1.0", "end")
+    assert "React Fiber 原理" in captions
+    assert "音频复识别前：React Fibr 原理" in captions
+
+
+def test_rejected_asr_is_not_a_confirmed_caption_and_can_be_manually_recovered(window):
+    from echomind.asr import TranscriptEvent
+    text = 'Hooks, React, Vue, JavaScript, Vue, JavaScript, Vue, JavaScript'
+    window._handle('transcript', TranscriptEvent('rejected', text, 1, 1, True,
+                                               rejection_reason='识别结果出现循环重复'))
+    assert text not in window.caption_text.get('1.0', 'end')
+    assert text not in window.compact_caption_text.get('1.0', 'end')
+    assert '已拦截' in window.partial.get()
+    assert '未发送' in window.repair_notice.get()
+    assert window.pending_repair == text
+    window.edit_repair()
+    assert window.test_question.get() == text
+
+
+@pytest.mark.parametrize("text", ["2-" * 35 + "2优优独播剧场——YoYo Television Series Exclusive",
+                                  "React, Vue, " * 12])
+def test_hallucination_pipeline_never_writes_captions_or_routes_question(window, text):
+    import struct
+    from unittest.mock import Mock
+    from echomind.asr import Transcriber
+    from echomind.cli import show_events
+
+    stream = Transcriber(retry_low_confidence=True, partial_interval_ms=30000)
+    stream._model = Mock()
+    stream._model.transcribe.side_effect = [
+        ([SimpleNamespace(text=text, avg_logprob=-.6)], None),
+        ([SimpleNamespace(text="欢迎订阅明镜", avg_logprob=-.2)], None),
+    ]
+    before = window.caption_text.get("1.0", "end")
+    compact_before = window.compact_caption_text.get("1.0", "end")
+    events = stream.push_pcm(struct.pack("<h", 800) * 4800 + bytes(600 * 32))
+    copilot = Mock()
+    show_events(events, copilot)
+    for event in events:
+        window._handle("transcript", event)
+    assert [event.kind for event in events] == ["rejected"]
+    assert window.caption_text.get("1.0", "end") == before
+    assert window.compact_caption_text.get("1.0", "end") == compact_before
+    assert "欢迎订阅明镜" not in window.partial.get()
+    assert "已拦截" in window.partial.get()
+    assert not window.question_records
+    copilot.submit_transcript.assert_not_called()
+    stream._model.transcribe.assert_called_once()
+
+
+def test_speech_topic_choice_controls_session_hotwords_and_custom_words(window):
+    from echomind.asr import DEFAULT_HOTWORDS
+    window.asr_topic.set("前端开发")
+    window._asr_topic_changed()
+    assert window.asr_hotwords.get() == DEFAULT_HOTWORDS
+    window.mode.set("离线演练")
+    assert window._config(text_test=True).asr_hotwords == DEFAULT_HOTWORDS
+    window.asr_hotwords.set("Redis, Kafka")
+    assert window.asr_topic.get() == "自定义"
+    window.asr_topic.set("通用")
+    window._asr_topic_changed()
+    assert window.asr_hotwords.get() == ""
+
+
+@pytest.mark.parametrize("saved_words", ["", "React Hooks, 自定义术语", "legacy"])
+def test_default_hotword_upgrade_preserves_custom_and_disabled_words(window, monkeypatch, saved_words):
+    from echomind.asr import DEFAULT_HOTWORDS, PREVIOUS_DEFAULT_HOTWORDS
+    value = PREVIOUS_DEFAULT_HOTWORDS if saved_words == "legacy" else saved_words
+    monkeypatch.setattr("echomind.gui.load_settings", lambda _: {"asr_hotwords": value})
+    root = tk.Toplevel(window.root)
+    root.withdraw()
+    app = EchoMindWindow(root, discover=lambda: [], settings_path=window.settings_path)
+    try:
+        assert app.asr_hotwords.get() == (DEFAULT_HOTWORDS if saved_words == "legacy" else value)
+    finally:
+        app._destroy()
+
+
+@pytest.mark.parametrize("scaling", [1.0, 2.0, 3.0])
+def test_sidebar_collapse_reclaims_space_and_preserves_configuration(window, scaling):
+    previous = window.root.tk.call("tk", "scaling")
+    try:
+        window.root.tk.call("tk", "scaling", scaling)
+        window.root.deiconify()
+        window.root.update()
+        window.test_question.set("已有问题草稿")
+        window.jev_key.set("offline-test-value")
+        panels = window.caption_text.master.master.master
+        width = panels.winfo_width()
+        geometry = window.root.geometry()
+        window.settings_button.invoke()
+        window.sidebar_toggle.invoke()
+        window.root.update_idletasks()
+        assert window.sidebar_collapsed
+        assert not window.sidebar.winfo_ismapped()
+        assert not window.settings_expanded
+        assert panels.winfo_width() > width + 250
+        assert window.sidebar_toggle.cget("text") == "展开"
+        assert window.navigation_rail.winfo_ismapped()
+        assert window.settings_button.winfo_ismapped()
+        assert window.root.geometry() == geometry
+        window.sidebar_toggle.invoke()
+        window.root.update_idletasks()
+        assert window.sidebar.winfo_ismapped()
+        assert panels.winfo_width() == width
+        assert window.test_question.get() == "已有问题草稿"
+        assert window.jev_key.get() == "offline-test-value"
+    finally:
+        window.root.tk.call("tk", "scaling", previous)
+
+
+def test_sidebar_toggle_does_not_interrupt_capture_or_follow(window):
+    session = SimpleNamespace(is_running=True)
+    window.session = session
+    window._busy(True)
+    window.sidebar_toggle.invoke()
+    window._set_compact_mode(True)
+    window._set_compact_mode(False)
+    assert window.sidebar_collapsed
+    assert window.session is session
+    assert str(window.source_combo.cget("state")) == "disabled"
+    window.sidebar_toggle.invoke()
+    assert not window.sidebar_collapsed
+
+
+def test_unified_source_selection_switches_microphone_and_meeting(window):
+    assert not hasattr(window, "process_combo")
+    window.source_combo.set("本机麦克风")
+    window.source_combo.event_generate("<<ComboboxSelected>>")
+    assert window.start_button.cget("text") == "开始测试"
+    window.source_combo.set("腾讯会议")
+    window.source_combo.event_generate("<<ComboboxSelected>>")
+    assert window.start_button.cget("text") == "开始采集"
+
+
+@pytest.mark.parametrize("geometry", ["1040x740", "1320x820"])
+@pytest.mark.parametrize("collapsed", [False, True])
+def test_optimized_layout_aligns_controls_and_preserves_content(window, geometry, collapsed):
+    window.root.geometry(geometry)
+    window.root.deiconify()
+    if collapsed:
+        window.sidebar_toggle.invoke()
+    window.root.update()
+    toolbar = window.capture_toolbar
+    controls = (window.source_combo, window.refresh_button, window.start_button, window.stop_button)
+    centers = [control.winfo_rooty() + control.winfo_height() // 2 for control in controls]
+    assert max(centers) - min(centers) <= 2
+    for control in controls:
+        assert control.winfo_rootx() >= toolbar.winfo_rootx()
+        assert control.winfo_rootx() + control.winfo_width() <= toolbar.winfo_rootx() + toolbar.winfo_width()
+    assert window.caption_text.winfo_height() >= 100
+    assert window.answer_text.winfo_height() >= 100
+    assert window.add_caption_button.winfo_ismapped()
+    assert window.question_entry.winfo_width() >= 100
+    window.source_combo.set("本机麦克风")
+    window.source_combo.event_generate("<<ComboboxSelected>>")
+    window.root.update_idletasks()
+    assert not window.refresh_button.winfo_ismapped()
+    assert window.start_button.winfo_ismapped()
+
+
+@pytest.mark.parametrize("scaling", [1.0, 2.0, 3.0])
+def test_compact_follow_layout_restores_full_window(window, scaling):
+    window.root.after_cancel(window._follow_timer)
+    previous = window.root.tk.call("tk", "scaling")
+    try:
+        window.root.tk.call("tk", "scaling", scaling)
+        window.root.deiconify()
+        window.root.update()
+        geometry, minimum = window.root.geometry(), window.root.minsize()
+        session = SimpleNamespace(is_running=True)
+        window.session = session
+        window._set_compact_mode(True)
+        window.root.update()
+        assert not window.full_view.winfo_ismapped()
+        assert window.compact_caption_text.winfo_ismapped()
+        assert window.compact_question_text.winfo_ismapped()
+        assert not window.answer_text.winfo_ismapped()
+        assert window.root.winfo_width() < int(geometry.split("x")[0])
+        button = window.exit_follow_button
+        assert button.winfo_rootx() + button.winfo_width() <= window.root.winfo_rootx() + window.root.winfo_width()
+        assert window._set_compact_mode(True) is False
+        window._set_compact_mode(False)
+        window.root.update()
+        assert window.root.geometry() == geometry
+        assert window.root.minsize() == minimum
+        assert window.full_view.winfo_ismapped()
+        assert window.session is session
+    finally:
+        window.root.tk.call("tk", "scaling", previous)
+
+
+def test_compact_content_updates_without_switching_session(window):
+    window._handle("transcript", SimpleNamespace(kind="final", text="解释一下 React Fiber 原理"))
+    window._handle("answer", AnswerEvent("start", 1, "解释一下 React Fiber 原理"))
+    window._set_compact_mode(True)
+    assert "React Fiber" in window.compact_caption_text.get("1.0", "end")
+    assert "React Fiber" in window.compact_question_text.get("1.0", "end")
+    window._handle("transcript", SimpleNamespace(kind="partial", text="还有一个问题"))
+    assert "还有一个问题" in window.partial.get()
+    window._handle("transcript", SimpleNamespace(kind="final", text="Promise 的作用是什么"))
+    window._handle("answer", AnswerEvent("start", 2, "Promise 的作用是什么"))
+    assert "Promise" in window.compact_caption_text.get("1.0", "end")
+    questions = window.compact_question_text.get("1.0", "end")
+    assert questions.index("Promise") < questions.index("React Fiber")
+    window._set_compact_mode(False)
+    assert "Promise" in window.caption_text.get("1.0", "end")
+
+
+def test_follow_compacts_only_with_target_and_exits(window):
+    window.follow_enabled.set(True)
+    window.processes = {"meeting": 42}
+    window.process.set("meeting")
+    calls = []
+    window.follower = SimpleNamespace(target=None, tick=lambda *args, **kwargs: calls.append(kwargs) or "跟随")
+    window._follow_tick()
+    assert not window.compact_mode
+    window.follower.target = 123
+    window._follow_tick()
+    assert window.compact_mode
+    window.exit_follow_button.invoke()
+    assert not window.follow_enabled.get()
+    assert not window.compact_mode
+    assert calls[-1]["enabled"] is False
+
+
+def test_follow_lost_target_and_microphone_restore_full_view(window):
+    window.follow_enabled.set(True)
+    window.follower = SimpleNamespace(target=123, tick=lambda *args, **kwargs: "跟随")
+    window._follow_tick()
+    assert window.compact_mode
+    window.follower.target = None
+    window._follow_tick()
+    assert not window.compact_mode
+    window.follower.target = 123
+    window._follow_tick()
+    window.source.set("本机麦克风")
+    window._follow_tick()
+    assert not window.compact_mode
+
+
+def test_compact_switch_preserves_manual_minimization(window):
+    window.root.after_cancel(window._follow_timer)
+    window.root.deiconify()
+    window.root.update()
+    window.root.iconify()
+    window.root.update()
+    window._set_compact_mode(True)
+    assert window.root.state() == "iconic"
+    window._set_compact_mode(False)
+    assert window.root.state() == "iconic"
+
+
 def test_screenshot_cancel_preserves_draft(window, monkeypatch):
     monkeypatch.setattr("echomind.gui.filedialog.askopenfilename", lambda **kwargs: "")
     window.test_question.set("已有草稿")
@@ -149,8 +499,9 @@ def shortcut_dialog(window):
 def test_settings_entry_is_fixed_below_sidebar_scroll(window, shortcut_dialog):
     dialog, entries, buttons = shortcut_dialog
     assert window.settings_button.winfo_ismapped()
-    assert window.settings_button.winfo_rooty() >= window.settings_canvas.winfo_rooty() + window.settings_canvas.winfo_height()
-    assert [entry.get() for entry in entries] == ["Enter", "Ctrl+R", "Ctrl+S"]
+    assert window.settings_button.master == window.navigation_rail
+    assert window.settings_button.winfo_rooty() > window.navigation_buttons[-1].winfo_rooty()
+    assert [entry.get() for entry in entries] == ["Enter", "Ctrl+R", "Ctrl+S", "Ctrl+F"]
     assert dialog.grab_current() == dialog
     assert dialog.bind("<Escape>")
     for button in buttons.values():
@@ -220,6 +571,7 @@ def test_update_menu_checks_in_background_and_displays_release(window, monkeypat
     window.root.deiconify()
     window.settings_button.invoke()
     assert window.update_dialog is None
+    window.maintenance_menu_button.invoke()
     window.update_menu_button.invoke()
     assert window.checking_updates
     assert window.recheck_update_button.instate(["disabled"])
@@ -281,7 +633,7 @@ def test_installer_launch_failure_does_not_exit_app(window, monkeypatch, tmp_pat
 def test_settings_button_expands_menu_without_opening_shortcuts(window):
     window.root.deiconify()
     window.root.update()
-    assert window.settings_button.cget("style") == "Primary.TButton"
+    assert window.settings_button.cget("style") == "Rail.TButton"
     assert not window.settings_menu.winfo_ismapped()
     window.settings_button.invoke()
     window.root.update()
@@ -289,27 +641,111 @@ def test_settings_button_expands_menu_without_opening_shortcuts(window):
     assert window.settings_menu.winfo_ismapped()
     assert window.shortcut_settings_button.winfo_ismapped()
     assert window.settings_dialog is None
-    assert "−" in window.settings_button.cget("text")
+    assert window.settings_button.instate(["selected"])
     window.settings_button.invoke()
     window.root.update()
     assert not window.settings_expanded
     assert not window.settings_menu.winfo_ismapped()
-    assert "+" in window.settings_button.cget("text")
+    assert window.settings_button.instate(["!selected"])
 
 
 @pytest.mark.parametrize("scaling", [1.0, 2.0, 3.0])
-def test_expanded_settings_menu_remains_inside_sidebar(window, scaling):
+def test_dropdown_stays_visible_without_reflowing_sidebar(window, scaling):
     previous = window.root.tk.call("tk", "scaling")
     try:
         window.root.tk.call("tk", "scaling", scaling)
         window.root.deiconify()
+        window.root.update()
+        previous_y = window.settings_button.winfo_rooty()
+        previous_canvas_height = window.settings_canvas.winfo_height()
         window.settings_button.invoke()
         window.root.update()
         for button in (window.settings_button, window.shortcut_settings_button):
             assert button.winfo_ismapped()
             assert button.winfo_rooty() + button.winfo_height() <= window.root.winfo_rooty() + window.root.winfo_height()
+        assert window.settings_button.winfo_rooty() == previous_y
+        assert window.settings_canvas.winfo_height() == previous_canvas_height
+        assert window.settings_popup.winfo_rootx() >= window.root.winfo_rootx()
+        assert window.settings_popup.winfo_rootx() + window.settings_popup.winfo_width() <= window.root.winfo_rootx() + window.root.winfo_width()
     finally:
         window.root.tk.call("tk", "scaling", previous)
+
+
+def test_dropdown_outside_click_and_keyboard_navigation(window):
+    window.root.deiconify()
+    window.root.update()
+    window.root.focus_force()
+    window.settings_button.invoke()
+    window.root.update()
+    window.shortcut_settings_button.event_generate("<Down>")
+    window.root.update()
+    assert window.root.focus_get() == window.follow_menu_button
+    window.follow_menu_button.event_generate("<Up>")
+    window.root.update()
+    assert window.root.focus_get() == window.shortcut_settings_button
+    window.shortcut_settings_button.event_generate("<Escape>")
+    window.root.update()
+    assert not window.settings_expanded
+    assert window.root.focus_get() == window.settings_button
+    window.settings_button.invoke()
+    window.question_entry.event_generate("<ButtonPress-1>")
+    window.root.update()
+    assert not window.settings_expanded
+
+
+def test_dropdown_selection_closes_before_opening_settings(window):
+    window.root.deiconify()
+    window.root.update()
+    window.settings_button.invoke()
+    window.shortcut_settings_button.invoke()
+    assert not window.settings_expanded
+    assert not window.settings_popup.winfo_ismapped()
+    assert window.settings_dialog is not None
+    window.settings_dialog.event_generate("<Escape>")
+
+
+def test_dropdown_uniform_rows_and_focus_loss_closes(window):
+    window.root.deiconify()
+    window.root.update()
+    window.root.focus_force()
+    window.settings_button.invoke()
+    window.root.update()
+    assert len({button.winfo_height() for button in window._settings_buttons}) == 1
+    assert all(button.cget("style") == "Dropdown.TButton" for button in window._settings_buttons)
+    other = tk.Toplevel(window.root)
+    try:
+        other.update()
+        other.focus_force()
+        window.root.update()
+        assert not window.settings_expanded
+    finally:
+        other.destroy()
+
+
+def test_dropdown_enter_opens_only_once_and_returns_focus(window):
+    window.root.deiconify()
+    window.root.update()
+    window.root.focus_force()
+    window.settings_button.invoke()
+    window.root.update()
+    window.shortcut_settings_button.event_generate("<Return>")
+    window.root.update()
+    assert window.settings_dialog is not None
+    assert not window.settings_expanded
+    window.settings_dialog.event_generate("<Escape>")
+    window.root.update()
+    assert window.settings_dialog is None
+    assert window.root.focus_get() == window.settings_button
+
+
+def test_dropdown_busy_state_closes_and_prevents_opening(window):
+    window.root.deiconify()
+    window.root.update()
+    window.settings_button.invoke()
+    window._busy(True)
+    assert not window.settings_expanded
+    window.settings_button.invoke()
+    assert not window.settings_expanded
 
 
 def test_burst_stream_yields_for_paint_before_completion(window):
@@ -540,7 +976,7 @@ def test_tab_sizes_are_equal_and_do_not_change_on_selection(window):
     mapped = tk.BooleanVar(window.root)
     window.root.after(100, lambda: mapped.set(True))
     window.root.wait_variable(mapped)
-    for notebook in (window.settings_tabs, window.answer_tabs):
+    for notebook in (window.answer_tabs,):
         measurements = []
         for selected in range(len(notebook.tabs())):
             notebook.select(selected)
@@ -607,14 +1043,67 @@ def test_desktop_layout_keeps_editor_and_panels_visible(window, geometry):
 
 
 def test_settings_tabs_and_mode_explanation(window):
-    assert [window.settings_tabs.tab(tab, "text") for tab in window.settings_tabs.tabs()] == ["基本", "模型", "Jev"]
+    assert [window.settings_tabs.tab(tab, "text") for tab in window.settings_tabs.tabs()] == ["基本", "语音", "模型", "Jev"]
     window.mode.set("离线演练")
     assert "固定示例" in window.mode_hint.get()
     window.mode.set("DeepSeek 在线回答")
     assert "密钥" in window.mode_hint.get()
-    window.mode.set("仅字幕（本地）")
+    window.mode.set("仅字幕")
     assert "不生成回答" in window.mode_hint.get()
     assert "不检测问题" in window.detection.get()
+
+
+def test_navigation_rail_switches_pages_without_losing_drafts(window):
+    window.root.deiconify()
+    window.root.update()
+    window.api_key.set("draft-key")
+    window.navigation_buttons[2].invoke()
+    window.root.update()
+    assert window.settings_tabs.index("current") == 2
+    assert window.settings_heading.get() == "回答模型"
+    assert window.navigation_buttons[2].instate(["selected"])
+    window.navigation_buttons[2].invoke()
+    window.root.update()
+    assert window.sidebar_collapsed and not window.sidebar.winfo_ismapped()
+    assert window.navigation_buttons[2].instate(["!selected"])
+    window.navigation_buttons[1].invoke()
+    window.root.update()
+    assert not window.sidebar_collapsed and window.sidebar.winfo_ismapped()
+    assert window.settings_tabs.index("current") == 1
+    assert window.api_key.get() == "draft-key"
+    assert all(button.cget("image") for button in window.navigation_buttons)
+    assert len({button.winfo_height() for button in window.navigation_buttons}) == 1
+
+
+def test_settings_submenu_stays_inside_window_and_supports_keyboard(window):
+    window.root.geometry("1040x740")
+    window.root.deiconify()
+    window.root.update()
+    window.root.focus_force()
+    window.toggle_sidebar()
+    window.settings_button.invoke()
+    window.root.update()
+    window.maintenance_menu_button.invoke()
+    window.root.update()
+    assert window.settings_submenu_expanded
+    assert window.update_menu_button.winfo_ismapped()
+    assert window.root.focus_get() == window.update_menu_button
+    window.update_menu_button.event_generate("<Down>")
+    window.root.update()
+    assert window.root.focus_get() == window.component_menu_button
+    popup = window.settings_subpopup
+    assert popup.winfo_x() >= 0 and popup.winfo_y() >= 0
+    assert popup.winfo_x() + popup.winfo_width() <= window.root.winfo_width()
+    assert popup.winfo_y() + popup.winfo_height() <= window.root.winfo_height()
+    window.component_menu_button.event_generate("<Escape>")
+    window.root.update()
+    assert not window.settings_submenu_expanded
+    assert window.settings_expanded
+    assert window.root.focus_get() == window.maintenance_menu_button
+    window.maintenance_menu_button.invoke()
+    window.root.event_generate("<ButtonPress-1>", x=900, y=30)
+    window.root.update()
+    assert not window.settings_expanded and not popup.winfo_ismapped()
 
 
 def test_question_decision_is_visible_without_overwriting_answer(window):
@@ -633,7 +1122,6 @@ def test_saved_configuration_loads_on_next_launch(window, tk_host, monkeypatch):
     window.jev_key.set("fake-local-jev-key")
     window.source.set("本机麦克风")
     window.mode.set("DeepSeek 在线回答")
-    window.consent.set(True)
     window.save_config()
     assert "已保存" in window.config_notice.get()
     assert "fake-local-test-key" not in window.settings_path.read_text(encoding="utf-8")
@@ -645,11 +1133,40 @@ def test_saved_configuration_loads_on_next_launch(window, tk_host, monkeypatch):
         assert reopened.jev_key.get() == "fake-local-jev-key"
         assert reopened.source.get() == "本机麦克风"
         assert reopened.mode.get() == "DeepSeek 在线回答"
-        assert not reopened.consent.get()
         assert reopened.key_entry.cget("show") == "*"
         assert "已读取" in reopened.config_notice.get()
     finally:
         reopened._destroy()
+
+
+def test_jev_threshold_is_saved_loaded_and_passed_to_session(window, tk_host):
+    assert window.jev_threshold.get() == "85"
+    window.jev_threshold.set("67.5")
+    assert window.save_config()
+    root = tk.Toplevel(tk_host)
+    root.withdraw()
+    reopened = EchoMindWindow(root, discover=lambda: [], settings_path=window.settings_path)
+    try:
+        assert reopened.jev_threshold.get() == "67.5"
+        reopened.mode.set("离线演练")
+        assert reopened._config(text_test=True).question_threshold == 0.675
+        reopened._busy(True)
+        assert reopened.jev_threshold_input.instate(["disabled"])
+    finally:
+        reopened._destroy()
+
+
+@pytest.mark.parametrize("value", ["", "abc", "-1", "101", "nan", "inf"])
+def test_invalid_jev_threshold_is_rejected_before_save_and_start(window, value):
+    assert window.save_config()
+    previous = window.settings_path.read_bytes()
+    window.jev_threshold.set(value)
+    assert not window.save_config()
+    assert "0–100" in window.error.get()
+    assert window.settings_path.read_bytes() == previous
+    window.mode.set("离线演练")
+    with pytest.raises(ValueError, match="阈值"):
+        window._config(text_test=True)
 
 
 def test_save_failure_has_visible_feedback_and_retains_inputs(window, monkeypatch):
@@ -662,6 +1179,7 @@ def test_save_failure_has_visible_feedback_and_retains_inputs(window, monkeypatc
     window.api_key.set("fake-local-test-key")
     window.save_config()
     assert "保存失败" in window.config_notice.get()
+    assert "保存失败" in window.error.get()
     assert window.api_key.get() == "fake-local-test-key"
 
 
@@ -771,6 +1289,88 @@ def test_first_run_only_prompts_when_components_missing(window, monkeypatch, tmp
     assert called == [True]
 
 
+@pytest.mark.parametrize("scaling", [1.0, 1.5, 2.0, 3.0])
+def test_follow_settings_cancel_and_save(window, scaling):
+    from echomind.settings import load_settings
+    previous = window.root.tk.call("tk", "scaling")
+    window.root.tk.call("tk", "scaling", scaling)
+    window.root.deiconify()
+    window.open_follow_settings()
+    window.follow_toggle.invoke()
+    window.follow_dialog.focus_force()
+    window.follow_dialog.event_generate("<Escape>")
+    window.root.update()
+    assert not window.follow_enabled.get()
+    assert window.follow_dialog is None
+    window.open_follow_settings()
+    window.follow_toggle.invoke()
+    window.follow_side_combo.set("左侧")
+    window.root.update_idletasks()
+    dialog = window.follow_dialog
+    assert window.follow_save_button.winfo_rooty() + window.follow_save_button.winfo_height() <= dialog.winfo_rooty() + dialog.winfo_height()
+    window.follow_save_button.invoke()
+    assert window.follow_dialog is None
+    assert window.follow_enabled.get() and window.follow_side.get() == "left"
+    saved = load_settings(window.settings_path)
+    assert saved["follow_enabled"] and saved["follow_side"] == "left"
+    window.root.tk.call("tk", "scaling", previous)
+
+
+def test_application_selection_automatically_chooses_main_process(window):
+    rows = [{"ProcessId": 2, "ParentProcessId": 3, "Name": "wemeetapp.exe"}, {"ProcessId": 3, "Name": "wemeetapp.exe"}]
+    window._handle("processes", rows)
+    assert window.process.get() == "wemeetapp.exe · PID 3"
+    assert window.process_details == rows
+    assert window.source.get() == "腾讯会议"
+    assert tuple(window.source_combo.cget("values")) == ("腾讯会议", "本机麦克风")
+    window._handle("processes", [{"ProcessId": 4, "Name": "wemeetapp.exe"}])
+    assert window.processes[window.process.get()] == 4
+    window._handle("processes", [])
+    assert window.process.get() == ""
+    assert "未找到" in window.application_notice.get()
+
+
+def test_follow_shortcut_toggle_during_capture_and_guard_dialog(window):
+    window.session = SimpleNamespace(is_running=True)
+    window.processes = {"meeting": 42}
+    window.process.set("meeting")
+    window.follower = SimpleNamespace(target=123, tick=lambda *args, **kwargs: "跟随")
+    window._busy(True)
+    window._follow_shortcut()
+    assert window.follow_enabled.get() and window.compact_mode
+    window._follow_shortcut()
+    assert not window.follow_enabled.get() and not window.compact_mode
+    assert window.session.is_running
+    assert window.root.bind("<Control-f>")
+    window.source.set("本机麦克风")
+    window._follow_shortcut()
+    assert not window.follow_enabled.get()
+    assert "腾讯会议" in window.error.get()
+
+
+def test_custom_follow_shortcut_is_saved_and_rebound(window):
+    from echomind.settings import load_settings
+    window.shortcuts["shortcut_follow"].set("F10")
+    assert window.save_config()
+    assert not window.root.bind("<Control-f>")
+    assert window.root.bind("<F10>")
+    assert load_settings(window.settings_path)["shortcut_follow"] == "F10"
+
+
+def test_follow_tick_uses_selection_and_pauses_for_microphone(window, monkeypatch):
+    calls = []
+    window.follower = SimpleNamespace(tick=lambda *args, **kwargs: calls.append((args, kwargs)) or "跟随测试")
+    window.follow_enabled.set(True)
+    window.processes = {"会议": 22}
+    window.process.set("会议")
+    window._follow_tick()
+    assert calls[-1][0][0] == 22 and calls[-1][1]["enabled"]
+    window.source.set("本机麦克风")
+    window._follow_tick()
+    assert not calls[-1][1]["enabled"]
+    assert "麦克风" in window.follow_notice.get()
+
+
 def test_secrets_are_masked_by_default_and_clear_on_exit(window):
     assert window.key_entry.cget("show") == "*"
     assert window.jev_entry.cget("show") == "*"
@@ -781,11 +1381,28 @@ def test_secrets_are_masked_by_default_and_clear_on_exit(window):
     assert window.jev_key.get() == ""
 
 
-def test_requires_consent_for_capture_but_not_offline_text_test(window):
-    with pytest.raises(ValueError, match="授权"):
-        window._config()
+def test_meeting_capture_does_not_require_participant_checkbox(window):
+    window.processes = {"腾讯会议": 123}
+    window.process.set("腾讯会议")
+    assert window._config().pid == 123
     window.mode.set("离线演练")
     assert window._config(text_test=True).answer_mode == "demo"
+
+
+def test_sidebar_has_no_config_status_privacy_block_or_participant_checkbox(window):
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from descendants(child)
+
+    for widget in descendants(window.root):
+        if "textvariable" in widget.keys():
+            assert str(widget.cget("textvariable")) != str(window.config_notice)
+        if "text" in widget.keys():
+            text = str(widget.cget("text"))
+            assert "使用与隐私" not in text
+            assert "参与者授权" not in text
+            assert "在线回答发送问题及近期问答" not in text
 
 
 def test_microphone_configuration_bypasses_meeting(window):
@@ -889,6 +1506,53 @@ def test_missing_caption_selection_preserves_draft(window):
     assert window.test_question.get() == "已有草稿"
 
 
+def test_selected_captions_merge_in_display_order_without_unselected_lines(window):
+    window._write(window.caption_text, "01:55:07  设计一个灰度发布方案\n01:55:08  好的\n01:55:11  支持按用户ID逐步放量\n")
+    window.test_question.set("另一道题的旧草稿")
+    window._toggle_caption_selection("3.0")
+    window._toggle_caption_selection("1.0")
+    assert "已选 2 条" in window.caption_selection_notice.get()
+    window.merge_selected_captions()
+    assert window.test_question.get() == "设计一个灰度发布方案 支持按用户ID逐步放量"
+    assert window.session is None and not window.question_records
+    assert not window.caption_text.tag_ranges("caption_pick")
+
+
+def test_caption_selection_can_be_toggled_and_ignores_diagnostic_notes(window):
+    window._write(window.caption_text, "01:55:07  解释一下React Fiber\n  音频复识别前：React Fibr\n01:55:11  原理。\n")
+    window._toggle_caption_selection("1.0")
+    window._toggle_caption_selection("1.0")
+    window._toggle_caption_selection("2.0")
+    assert not window.caption_text.tag_ranges("caption_pick")
+    window.caption_text.tag_add("sel", "1.0", "4.0")
+    window.merge_selected_captions()
+    assert window.test_question.get() == "解释一下React Fiber 原理。"
+    assert "React Fibr" in window.caption_text.get("1.0", "end")
+
+
+def test_new_subtitle_does_not_join_existing_manual_selection(window):
+    window._write(window.caption_text, "01:55:07  解释一下React Fiber\n")
+    window._toggle_caption_selection("1.0")
+    window._handle("transcript", SimpleNamespace(kind="final", text="下一道问题"))
+    window.merge_selected_captions()
+    assert window.test_question.get() == "解释一下React Fiber"
+
+
+def test_caption_selection_remains_correct_when_old_history_is_trimmed(window):
+    window._write(window.caption_text, "无关字幕\n" * 395 + "01:55:07  保留的提问\n")
+    window._toggle_caption_selection("396.0")
+    window._write(window.caption_text, "新字幕\n" * 20)
+    window.merge_selected_captions()
+    assert window.test_question.get() == "保留的提问"
+
+
+def test_missing_merge_selection_preserves_draft(window):
+    window.test_question.set("已有草稿")
+    window.merge_selected_captions()
+    assert "多选" in window.error.get()
+    assert window.test_question.get() == "已有草稿"
+
+
 def test_current_and_history_questions_can_be_edited_without_changing_records(window):
     window.edit_current_question()
     assert "暂无" in window.error.get()
@@ -914,7 +1578,7 @@ def test_manual_submission_uses_running_session_and_draft_stays_editable(window)
     window.start_test()
     assert received == ["React Fiber 原理"]
     assert window.run_id == 0
-    window.mode.set("仅字幕（本地）")
+    window.mode.set("仅字幕")
     window._busy(True)
     assert str(window.test_button.cget("state")) == "disabled"
 

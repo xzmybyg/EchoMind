@@ -244,3 +244,95 @@ def test_suspect_is_reset_between_utterances_and_old_event_constructor_works() -
     assert first[0].suspect is True
     assert second[0].suspect is False
     assert TranscriptEvent("final", "旧构造", 0, 0).suspect is False
+
+
+def test_short_pause_keeps_both_parts_in_one_utterance():
+    recognize = Mock(return_value="设计一个灰度发布方案，支持按用户逐步放量")
+    stream = Transcriber(recognizer=recognize, end_silence_ms=900, partial_interval_ms=30_000)
+    assert stream.push_pcm(pcm(800, 300) + pcm(0, 600)) == []
+    events = stream.push_pcm(pcm(800, 300) + pcm(0, 900))
+    assert len(events) == 1
+    assert events[0].kind == "final"
+    recognize.assert_called_once()
+    assert len(recognize.call_args.args[0]) >= len(pcm(800, 1500))
+
+
+def test_low_confidence_audio_retry_preserves_original_and_resets_next_time():
+    stream = Transcriber(retry_low_confidence=True)
+    stream._model = Mock()
+    stream._model.transcribe.side_effect = [
+        ([SimpleNamespace(text="解释React Fibr原理", avg_logprob=-0.9)], None),
+        ([SimpleNamespace(text="解释React Fiber原理", avg_logprob=-0.4)], None),
+        ([SimpleNamespace(text="下一题", avg_logprob=-0.4)], None),
+    ]
+    text, _ = stream._transcribe(pcm(800, 500), final=True)
+    assert text == "解释React Fiber原理"
+    assert stream._last_original == "解释React Fibr原理"
+    assert not stream._last_suspect
+    assert [call.kwargs["beam_size"] for call in stream._model.transcribe.call_args_list] == [5, 8]
+    stream._transcribe(pcm(800, 500), final=True)
+    assert stream._last_original == ""
+
+
+def test_audio_retry_does_not_replace_with_unrelated_or_still_uncertain_text():
+    for revised, score in (("一个完全无关的句子", -0.3), ("解释React Fiber原理", -0.85)):
+        stream = Transcriber(retry_low_confidence=True)
+        stream._model = Mock()
+        stream._model.transcribe.side_effect = [
+            ([SimpleNamespace(text="解释React Fibr原理", avg_logprob=-0.9)], None),
+            ([SimpleNamespace(text=revised, avg_logprob=score)], None),
+        ]
+        text, _ = stream._transcribe(pcm(800, 500), final=True)
+        assert text == "解释React Fibr原理"
+        assert stream._last_suspect
+        assert stream._last_original == ""
+
+
+def test_confident_final_and_suspect_partial_do_not_retry():
+    stream = Transcriber(retry_low_confidence=True)
+    stream._model = Mock()
+    stream._model.transcribe.return_value = ([SimpleNamespace(text="问题", avg_logprob=-0.9)], None)
+    stream._transcribe(pcm(800, 500))
+    stream._model.transcribe.assert_called_once()
+    stream._model.reset_mock()
+    stream._model.transcribe.return_value = ([SimpleNamespace(text="问题", avg_logprob=-0.3)], None)
+    stream._transcribe(pcm(800, 500), final=True)
+    stream._model.transcribe.assert_called_once()
+
+
+def test_repetition_is_rejected_without_retrying_into_unrelated_captions():
+    stream = Transcriber(retry_low_confidence=True, hotwords="React Fiber")
+    stream._model = Mock()
+    stream._model.transcribe.side_effect = [
+        ([SimpleNamespace(text="React Fiber, " * 12, avg_logprob=-.6)], None),
+        ([SimpleNamespace(text="欢迎订阅明镜", avg_logprob=-.2)], None),
+    ]
+    text, _ = stream._transcribe(pcm(800, 500), final=True)
+    assert text == ("React Fiber, " * 12).strip()
+    assert stream._last_suspect and stream._last_rejection
+    assert not stream._last_original
+    stream._model.transcribe.assert_called_once()
+
+
+def test_repetition_across_segments_is_rejected_before_retry():
+    stream = Transcriber(retry_low_confidence=True)
+    stream._model = Mock()
+    stream._model.transcribe.return_value = (
+        [SimpleNamespace(text="React, Vue, ", avg_logprob=-.9) for _ in range(4)], None)
+    stream._audio.extend(pcm(800, 500))
+    event = stream._event("final", 500)
+    assert event.kind == "rejected"
+    stream._model.transcribe.assert_called_once()
+
+
+def test_failed_retry_does_not_replace_first_pass_alignment_or_error():
+    stream = Transcriber(retry_low_confidence=True)
+    stream._model = Mock()
+    stream._model.transcribe.side_effect = [
+        ([SimpleNamespace(text="低可信问题", avg_logprob=-.9, words=[SimpleNamespace(start=0, end=.3, word="低可信问题")])], None),
+        ([SimpleNamespace(text="无关无关无关", avg_logprob=-.1, words=[SimpleNamespace(start=.3, end=.5, word="无关无关无关")])], None),
+    ]
+    text, _ = stream._transcribe(pcm(800, 500), final=True, skip_before_ms=0)
+    assert text == "低可信问题" and stream._last_suspect
+    assert stream._last_word_end_ms == 300
+    assert not stream._last_rejection

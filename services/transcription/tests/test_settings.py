@@ -18,11 +18,48 @@ def test_missing_settings_do_not_create_a_file(tmp_path):
     assert not path.exists()
 
 
+@pytest.mark.parametrize("threshold", [0, 0.65, 0.85, 1])
+def test_question_threshold_roundtrip(tmp_path, threshold):
+    path = tmp_path / "settings.json"
+    save_settings({"question_threshold": threshold}, path)
+    assert load_settings(path)["question_threshold"] == threshold
+
+
+@pytest.mark.parametrize("threshold", [-0.01, 1.01, float("nan"), float("inf"), True, "0.85", None])
+def test_invalid_question_threshold_preserves_saved_config(tmp_path, threshold):
+    path = tmp_path / "settings.json"
+    save_settings({"question_threshold": 0.85}, path)
+    with pytest.raises(SettingsError):
+        save_settings({"question_threshold": threshold}, path)
+    assert load_settings(path)["question_threshold"] == 0.85
+
+
+def test_speech_settings_roundtrip_and_hotwords_limit(tmp_path):
+    path = tmp_path / "settings.json"
+    values = {"asr_hotwords": "React Fiber, Promise", "asr_model_path": "D:/models/large-v3"}
+    save_settings(values, path)
+    assert load_settings(path) == values
+    with pytest.raises(SettingsError):
+        save_settings({"asr_hotwords": "词" * 501}, path)
+    assert load_settings(path) == values
+
+
+@pytest.mark.parametrize("engine", ["whisper", "sensevoice", "paraformer", "tencent"])
+def test_engine_setting_roundtrip_and_invalid_value_preserves_config(tmp_path, engine):
+    path = tmp_path / "settings.json"
+    save_settings({"asr_engine": engine}, path)
+    assert load_settings(path)["asr_engine"] == engine
+    with pytest.raises(SettingsError):
+        save_settings({"asr_engine": "unknown"}, path)
+    assert load_settings(path)["asr_engine"] == engine
+
+
 def test_roundtrip_all_fields_and_no_plaintext_keys(tmp_path):
     path = tmp_path / "nested" / "settings.json"
     values = {"api_base_url": "https://api.example.com", "api_model": "model",
               "api_key": "fake-api-secret", "jev_key": "fake-jev-secret",
-              "answer_mode": "live", "device": "cpu", "source": "本机麦克风", "jev_enabled": True}
+              "answer_mode": "live", "device": "cpu", "source": "本机麦克风", "jev_enabled": True,
+              "follow_enabled": True, "follow_side": "left"}
     with patch("echomind.settings._protect_secret", side_effect=lambda value: "encrypted:" + value[::-1]), \
          patch("echomind.settings._unprotect_secret", side_effect=lambda value: value.split(":", 1)[1][::-1]):
         save_settings(values, path)
@@ -39,6 +76,8 @@ def test_roundtrip_all_fields_and_no_plaintext_keys(tmp_path):
                                      '{"version": 1, "jev_enabled": "yes"}',
                                      '{"version": 1, "answer_mode": "invalid"}',
                                      '{"version": 1, "source": "invalid"}',
+                                     '{"version": 1, "follow_enabled": "yes"}',
+                                     '{"version": 1, "follow_side": "top"}',
                                      '{"version": 1, "unrecognized": "fake-secret"}',
                                      '{"version": 1, "api_key_dpapi": "%%%"}'])
 def test_corrupt_file_is_preserved_without_leaking_contents(tmp_path, contents):

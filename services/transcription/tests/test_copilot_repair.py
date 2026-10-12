@@ -68,7 +68,8 @@ def test_suspect_flag_only_reviews_explicit_request_and_not_partial():
         copilot.submit_transcript("解释一下React原理", 3, suspect=True)
         assert copilot.wait_idle(2)
         assert reviewed == ["解释一下React原理"]
-        assert provider.requests == ["解释一下React原理"]
+        assert provider.requests == []
+        assert events[-1].kind == "needs_confirmation"
     finally:
         copilot.close()
 
@@ -92,7 +93,7 @@ def test_keyword_question_reviews_without_second_semantic_call():
         assert copilot.wait_idle(2)
         copilot.submit_transcript("Redis为什么快", 2, suspect=True)
         assert copilot.wait_idle(2)
-        assert provider.requests == ["讲解一下Redis为什么快"]
+        assert provider.requests == []
         assert judged == [("讲解一下", [])]
     finally:
         copilot.close()
@@ -317,5 +318,46 @@ def test_offline_low_confidence_needs_confirmation_without_guessing():
         assert events[-1].kind == "needs_confirmation"
         assert events[-1].text == "解释一下React原理"
         assert "置信度偏低" in events[-1].reason
+    finally:
+        copilot.close()
+
+
+def test_text_review_cannot_approve_low_confidence_books_transcript():
+    class Reviser:
+        async def review(self, text, recent):
+            return RepairResult(text, text, False, "复核通过")
+
+    provider, events = Provider(), []
+    copilot = Copilot(provider, events.append, question_reviser=Reviser())
+    try:
+        copilot.submit_transcript("讲解一下REAC的Books", 1, suspect=True)
+        assert copilot.wait_idle(2)
+        assert provider.requests == []
+        assert events[-1].kind == "needs_confirmation"
+        assert events[-1].text == "讲解一下REAC的Books"
+        assert "置信度偏低" in events[-1].reason
+        copilot.submit_question("讲解一下 React 的 Hooks")
+        assert copilot.wait_idle(2)
+        assert provider.requests == ["讲解一下 React 的 Hooks"]
+    finally:
+        copilot.close()
+
+
+def test_semantic_acceptance_and_text_review_cannot_override_audio_uncertainty():
+    class Gate:
+        async def evaluate(self, text, recent):
+            return 0.99
+
+    class Reviser:
+        async def review(self, text, recent):
+            return RepairResult(text, text, False, "复核通过")
+
+    provider, events = Provider(), []
+    copilot = Copilot(provider, events.append, question_gate=Gate(), question_reviser=Reviser())
+    try:
+        copilot.submit_transcript("REAC的Books", 1, suspect=True)
+        assert copilot.wait_idle(2)
+        assert provider.requests == []
+        assert events[-1].kind == "needs_confirmation"
     finally:
         copilot.close()

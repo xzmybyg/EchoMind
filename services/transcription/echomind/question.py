@@ -48,6 +48,11 @@ def is_filler(text: str) -> bool:
     return _key(text) in ("", "嗯", "啊", "哦", "好", "好的", "ok", "谢谢", "谢谢大家")
 
 
+def is_unfinished(text: str) -> bool:
+    """A dangling connector/request needs the next audio piece before answering."""
+    return bool(re.search(r"(?:的|和|与|以及|然后|一下|关于|比如|例如|包括|分别是)[，,。.!！?？\s]*$", text))
+
+
 def _classify(text: str, *, semantic_candidates: bool = False) -> str:
     """Return question, incomplete, or statement without using punctuation."""
     visible = _QUOTED.sub("", text)
@@ -55,6 +60,10 @@ def _classify(text: str, *, semantic_candidates: bool = False) -> str:
     for clause in _BOUNDARY.split(visible):
         direct = re.match(r"\s*(?:请|为什么|怎么|如何|什么|能不能|可不可以)", clause)
         if not semantic_candidates and ((not direct and _META.search(clause)) or _SELF_EXPLANATION.search(clause) or _SELF_LECTURE.search(clause)):
+            continue
+        if (not semantic_candidates and is_unfinished(clause)
+                and (_MARKER.search(clause) or _TASK_REQUEST.match(clause)) and not _REPORTED.search(clause)):
+            incomplete = True
             continue
         if _ARITHMETIC_REQUEST.fullmatch(clause):
             return "question"
