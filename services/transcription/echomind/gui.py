@@ -21,14 +21,15 @@ from .asr_backends import ENGINE_LABELS, experimental_model_path, validate_model
 from .desktop_session import DesktopSession, SessionConfig
 from .tencent_asr import TencentConfig
 from .components import (ComponentError, install_components,
-                         missing, resolve_paths)
+                         QWEN_MODEL, missing, resolve_paths)
+from .qwen_components import missing_qwen, resolve_runtime
 from .settings import SettingsError, config_path, load_settings, save_settings
 from .screenshot import ScreenshotError, clipboard_has_image, recognize_clipboard, recognize_screenshot
 from .shortcuts import DEFAULT_SHORTCUTS, validate_shortcuts
 from .updater import UpdateError, check_release, launch_installer, stage_update
 from .version import VERSION
 from .window_follow import WindowsAPI, WindowFollower, process_family
-from .gui_icons import navigation_icon
+from .gui_icons import button_background, checkbox_icon, navigation_icon
 
 
 COLORS = {"background": "#F5F5F5", "surface": "#FFFFFF", "text": "#141414",
@@ -204,12 +205,10 @@ class EchoMindWindow:
                   foreground=[("disabled", COLORS["disabled"]), ("active", COLORS["active"])],
                   bordercolor=[("focus", COLORS["primary"]), ("active", COLORS["primary"])])
         # Darker Ant blue keeps normal-sized white action text readable.
-        style.configure("Primary.TButton", background=COLORS["active"], foreground="white", bordercolor=COLORS["active"])
+        style.configure("Primary.TButton", background=COLORS["active"], foreground="white", bordercolor=COLORS["active"], focuscolor="white")
         style.map("Primary.TButton", background=[("disabled", COLORS["background"]), ("pressed", COLORS["pressed"]), ("active", COLORS["pressed"])],
                   foreground=[("disabled", COLORS["disabled"]), ("!disabled", "white")],
                   bordercolor=[("disabled", COLORS["border"]), ("!disabled", COLORS["primary"])])
-        style.layout("Dropdown.TButton", [("Button.padding", {"sticky": "nswe", "children": [
-            ("Button.focus", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]})]})])
         style.configure("Dropdown.TButton", background=COLORS["surface"], foreground=COLORS["text"],
                         padding=(12, 8), anchor="w", focuscolor=COLORS["primary"])
         style.map("Dropdown.TButton", background=[("pressed", COLORS["tint"]), ("focus", COLORS["tint"]), ("active", COLORS["background"])],
@@ -220,6 +219,50 @@ class EchoMindWindow:
         style.map("Rail.TButton", background=[("selected", COLORS["rail_selected"]), ("pressed", COLORS["rail_selected"]),
                   ("active", COLORS["rail_hover"])], foreground=[("!disabled", COLORS["text"])],
                   bordercolor=[("focus", COLORS["primary"])])
+        style.configure("Text.TButton", foreground=COLORS["active"])
+        style.map("Text.TButton", foreground=[("disabled", COLORS["disabled"]), ("!disabled", COLORS["active"])])
+        # All button roles share rounded corners, spacing and native ttk bindings.
+        scale = max(1, float(self.root.tk.call("tk", "scaling")) / (96 / 72))
+        host = self.root._root()
+        if not hasattr(host, "_button_images"):
+            host._button_images = {}
+        c = COLORS
+        button_colors = {
+            "TButton": [(c["control_border"], c["surface"]), (c["primary"], c["surface"]),
+                        (c["active"], c["tint"]), (c["border"], c["background"])],
+            "Primary.TButton": [(c["active"], c["active"]), (c["pressed"], c["pressed"]),
+                                (c["pressed"], c["pressed"]), (c["border"], c["background"])],
+            "Text.TButton": [(c["surface"], c["surface"]), (c["background"], c["background"]),
+                             (c["tint"], c["tint"]), (c["surface"], c["surface"])],
+            "Dropdown.TButton": [(c["surface"], c["surface"]), (c["background"], c["background"]),
+                                 (c["tint"], c["tint"]), (c["surface"], c["surface"])],
+            "Rail.TButton": [(c["rail"], c["rail"]), (c["rail_hover"], c["rail_hover"]),
+                             (c["rail_selected"], c["rail_selected"]), (c["rail"], c["rail"])],
+        }
+        for name, colors in button_colors.items():
+            element = f"Ant{round(6 * scale)}.{name}.border"
+            focus_fill = c["tint"] if name == "Dropdown.TButton" else colors[0][1]
+            if element not in style.element_names():
+                # Opaque corners mask ttk's state-colored widget background.
+                canvas = c["rail"] if name == "Rail.TButton" else c["surface"]
+                normal, hover, pressed, disabled = [button_background(self.root, scale, *pair, canvas) for pair in colors]
+                focus = button_background(self.root, scale, c["primary"], focus_fill, canvas)
+                host._button_images[element] = (normal, hover, pressed, disabled, focus)
+                states = [("disabled", disabled), ("pressed", pressed), ("focus", focus), ("active", hover)]
+                if name == "Rail.TButton":
+                    states.insert(1, ("selected", pressed))
+                style.element_create(element, "image", normal, *states,
+                                     border=round(6 * scale) + max(1, round(scale)),
+                                     padding=max(1, round(scale)), width=0, height=0, sticky="nswe")
+            backgrounds = [("disabled", colors[3][1]), ("pressed", colors[2][1]),
+                           ("focus", focus_fill), ("active", colors[1][1])]
+            if name == "Rail.TButton":
+                backgrounds.insert(1, ("selected", colors[2][1]))
+            style.map(name, background=backgrounds)
+            style.layout(name, [(element, {"sticky": "nswe", "children": [
+                ("Button.padding", {"sticky": "nswe", "children": [
+                    ("Button.focus", {"sticky": "nswe", "children": [
+                        ("Button.label", {"sticky": "nswe"})]})]})]})])
         style.configure("TEntry", padding=(8, 6), borderwidth=1, bordercolor=COLORS["control_border"],
                         lightcolor=COLORS["surface"], darkcolor=COLORS["surface"], fieldbackground=COLORS["surface"])
         style.map("TEntry", bordercolor=[("focus", COLORS["primary"])],
@@ -229,7 +272,36 @@ class EchoMindWindow:
         style.map("TCombobox", fieldbackground=[("readonly", COLORS["surface"])],
                   background=[("readonly", COLORS["surface"])], bordercolor=[("focus", COLORS["primary"])],
                   foreground=[("disabled", COLORS["disabled"]), ("readonly", COLORS["text"])])
-        style.configure("TCheckbutton", background=COLORS["surface"], padding=(0, 6))
+        # Keep ttk's checkbox bindings and label focus; replace only its indicator.
+        indicator_size = max(16, round(12 * float(self.root.tk.call("tk", "scaling"))))
+        indicator = f"AntCheck{indicator_size}.indicator"
+        if indicator not in style.element_names():
+            normal = checkbox_icon(self.root, indicator_size, COLORS["control_border"], COLORS["surface"])
+            hover = checkbox_icon(self.root, indicator_size, COLORS["primary"], COLORS["surface"])
+            checked = checkbox_icon(self.root, indicator_size, COLORS["primary"], COLORS["primary"], "check")
+            pressed = checkbox_icon(self.root, indicator_size, COLORS["active"], COLORS["active"], "check")
+            mixed = checkbox_icon(self.root, indicator_size, COLORS["primary"], COLORS["primary"], "mixed")
+            disabled = checkbox_icon(self.root, indicator_size, COLORS["border"], COLORS["background"])
+            disabled_checked = checkbox_icon(self.root, indicator_size, COLORS["border"], COLORS["background"], "check", COLORS["disabled"])
+            disabled_mixed = checkbox_icon(self.root, indicator_size, COLORS["border"], COLORS["background"], "mixed", COLORS["disabled"])
+            images = (normal, hover, checked, pressed, mixed, disabled, disabled_checked, disabled_mixed)
+            # Styles live in the Tcl interpreter, including after a dialog closes.
+            host = self.root._root()
+            if not hasattr(host, "_checkbox_images"):
+                host._checkbox_images = {}
+            host._checkbox_images[indicator] = images
+            style.element_create(indicator, "image", normal,
+                                 ("disabled", "selected", disabled_checked), ("disabled", "alternate", disabled_mixed),
+                                 ("disabled", disabled), ("pressed", "selected", pressed),
+                                 ("selected", checked), ("alternate", mixed), ("active", hover), ("focus", hover))
+        style.layout("TCheckbutton", [("Checkbutton.padding", {"sticky": "nswe", "children": [
+            (indicator, {"side": "left", "sticky": ""}),
+            ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [
+                ("Checkbutton.label", {"sticky": "nswe"})]})]})])
+        style.configure("TCheckbutton", background=COLORS["surface"], padding=(0, 6), focuscolor=COLORS["primary"])
+        style.map("TCheckbutton", background=[("!disabled", COLORS["surface"]), ("disabled", COLORS["surface"])],
+                  foreground=[("disabled", COLORS["disabled"])])
+        self.caption_checkbox_images = self.root._root()._checkbox_images[indicator][0:3:2]
         style.configure("TNotebook", background=COLORS["surface"], borderwidth=0, tabmargins=(0, 0, 0, 1))
         # Omit the theme's raised tab border and selected-only padding.
         style.layout("TNotebook.Tab", [("Notebook.padding", {"sticky": "nswe", "children": [
@@ -322,8 +394,12 @@ class EchoMindWindow:
         engine_combo.bind("<<ComboboxSelected>>", self._asr_engine_changed)
         topic_combo = self._combo(speech, 2, "术语场景", self.asr_topic, ["通用", "前端开发", "自定义"])
         topic_combo.bind("<<ComboboxSelected>>", self._asr_topic_changed)
-        self._entry(speech, 4, "技术热词（逗号分隔）", self.asr_hotwords)
-        ttk.Label(speech, text="仅填写短术语，不填写整句或答案。留空不传热词。腾讯云热词参与流式识别；实验引擎不支持热词。", style="Card.TLabel",
+        ttk.Label(speech, text="技术热词", style="Card.TLabel").grid(row=4, column=0, sticky="w", pady=(12, 4))
+        self.hotwords_button = ttk.Button(speech, text="编辑热词", command=self.open_hotwords)
+        self.hotwords_button.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        self.form_controls.append((self.hotwords_button, "normal"))
+        self.hotwords_dialog = None
+        ttk.Label(speech, text="点击编辑术语列表。Whisper、腾讯云支持；Qwen 与其他实验引擎不启用热词。", style="Card.TLabel",
                   foreground=COLORS["muted"], wraplength=225).grid(row=6, column=0, sticky="ew", pady=(0, 12))
         self.local_asr_fields = ttk.Frame(speech, style="Card.TFrame")
         self.local_asr_fields.columnconfigure(0, weight=1)
@@ -364,7 +440,7 @@ class EchoMindWindow:
                   style="Card.TLabel", foreground=COLORS["muted"], wraplength=225).grid(row=5, column=0, sticky="ew", pady=(4, 8))
         ttk.Label(semantic, text="需在线回答模式及独立 TypeSafe 密钥。本地规则未命中的确定字幕交给 Jev 判断，增加调用量和延迟。",
                   style="Hint.TLabel", wraplength=225).grid(row=6, column=0, sticky="ew", pady=12)
-        self.save_button = ttk.Button(settings, text="保存配置（含加密密钥）", command=self.save_config)
+        self.save_button = ttk.Button(settings, text="保存配置（含加密密钥）", style="Primary.TButton", command=self.save_config)
         self.save_button.grid(row=2, column=0, sticky="ew", pady=(12, 8))
         self.form_controls.append((self.save_button, "normal"))
         self.settings_popup = tk.Canvas(self.root, bg=COLORS["background"], highlightthickness=0)
@@ -462,7 +538,7 @@ class EchoMindWindow:
         ttk.Label(captions, textvariable=self.caption_source, style="Card.TLabel", foreground=COLORS["muted"]).pack(anchor="w", pady=(4, 8))
         partial_label = ttk.Label(captions, textvariable=self.partial, style="Hint.TLabel", wraplength=320)
         partial_label.pack(side="bottom", fill="x", pady=(8, 0))
-        self.add_caption_button = ttk.Button(caption_header, text="加入问题", command=self.add_selected_caption)
+        self.add_caption_button = ttk.Button(caption_header, text="加入问题", width=12, command=self.add_selected_caption)
         self.add_caption_button.pack(side="right")
         self.caption_text = self._text(captions)
         self.caption_text.configure(exportselection=False)
@@ -470,12 +546,12 @@ class EchoMindWindow:
         self.caption_text.tag_configure("caption_pick", background=COLORS["tint"], foreground=COLORS["active"])
         self.caption_text.bind("<Control-Button-1>", self._pick_caption_click)
         self.caption_text.bind("<Control-space>", lambda _: self._toggle_caption_selection("insert"))
-        self.caption_text.bind("<Button-1>", lambda _: self._clear_caption_selection())
+        self.caption_text.bind("<Button-1>", self._caption_click)
         self.caption_text.bind("<Escape>", lambda _: self._clear_caption_selection() or "break")
-        self.caption_selection_notice = tk.StringVar(value="Ctrl＋单击多选字幕；也可拖选连续文字")
+        self.caption_selection_notice = tk.StringVar(value="勾选多条字幕；也可 Ctrl＋单击或拖选文字")
         selection_bar = ttk.Frame(captions, style="Card.TFrame")
         selection_bar.pack(fill="x", before=self.caption_text.master, pady=(0, 8))
-        self.merge_caption_button = ttk.Button(selection_bar, text="合并为问题", command=self.merge_selected_captions)
+        self.merge_caption_button = ttk.Button(selection_bar, text="合并为问题", width=12, command=self.merge_selected_captions)
         self.merge_caption_button.pack(side="right")
         selection_hint = ttk.Label(selection_bar, textvariable=self.caption_selection_notice, style="Card.TLabel",
                                    foreground=COLORS["muted"], wraplength=220)
@@ -485,7 +561,7 @@ class EchoMindWindow:
         answer_header = ttk.Frame(answers, style="Card.TFrame")
         answer_header.pack(fill="x")
         ttk.Label(answer_header, text="回答要点", style="Card.TLabel", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
-        ttk.Button(answer_header, text="编辑当前问题", command=self.edit_current_question).pack(side="right")
+        ttk.Button(answer_header, text="编辑当前问题", style="Text.TButton", command=self.edit_current_question).pack(side="right")
         detection_label = ttk.Label(answers, textvariable=self.detection, style="Card.TLabel", foreground=COLORS["muted"], wraplength=330)
         detection_label.pack(fill="x", pady=(8, 0))
         question_label = ttk.Label(answers, textvariable=self.question, style="Hint.TLabel", wraplength=330)
@@ -501,7 +577,7 @@ class EchoMindWindow:
         repair_label.pack(fill="x")
         ttk.Button(self.repair_panel, text="核对并编辑", command=self.edit_repair).pack(anchor="w", pady=(6, 0))
         answers.bind("<Configure>", lambda e: repair_label.configure(wraplength=max(120, e.width - 56)), add="+")
-        ttk.Button(history, text="编辑选中问题", command=self.edit_history_question).pack(anchor="w", pady=(0, 8))
+        ttk.Button(history, text="编辑选中问题", style="Text.TButton", command=self.edit_history_question).pack(anchor="w", pady=(0, 8))
         history_list = ttk.Frame(history, style="Card.TFrame")
         history_list.pack(fill="x")
         self.history_tree = ttk.Treeview(history_list, columns=("time", "state"), height=4, selectmode="browse")
@@ -524,23 +600,22 @@ class EchoMindWindow:
         history.bind("<Configure>", lambda e: [label.configure(wraplength=max(120, e.width - 56)) for label in (history_question, history_status)])
         test = ttk.Frame(main, style="Panel.TFrame", padding=12)
         test.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-        edit_header = ttk.Frame(test, style="Card.TFrame")
-        edit_header.pack(fill="x", pady=(0, 8))
-        ttk.Label(edit_header, text="问题编辑 · 核对后提交", style="Card.TLabel").pack(side="left")
-        self.screenshot_button = ttk.Button(edit_header, text="粘贴题目截图", command=self.paste_screenshot)
-        self.screenshot_button.pack(side="right")
-        self.import_screenshot_button = ttk.Button(edit_header, text="选择图片", command=self.import_screenshot)
-        self.import_screenshot_button.pack(side="right", padx=(8, 8))
-        test_row = ttk.Frame(test, style="Card.TFrame")
-        test_row.pack(fill="x")
-        self.question_entry = ttk.Entry(test_row, textvariable=self.test_question)
-        self.question_entry.pack(side="left", fill="x", expand=True)
+        test.columnconfigure(0, weight=1)
+        test.columnconfigure((1, 2), uniform="editor_actions")
+        ttk.Label(test, text="问题编辑 · 核对后提交", style="Card.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        self.import_screenshot_button = ttk.Button(test, text="选择图片", command=self.import_screenshot)
+        self.import_screenshot_button.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 8))
+        self.screenshot_button = ttk.Button(test, text="粘贴题目截图", command=self.paste_screenshot)
+        self.screenshot_button.grid(row=0, column=2, sticky="ew", padx=(8, 0), pady=(0, 8))
+        self.question_entry = ttk.Entry(test, textvariable=self.test_question)
+        self.question_entry.grid(row=1, column=0, sticky="ew")
         self.question_entry.bind("<Control-v>", self._paste_image_shortcut)
-        ttk.Button(test_row, text="清空", command=lambda: self.test_question.set("")).pack(side="left", padx=(8, 0))
-        self.test_button = ttk.Button(test_row, text="提交回答 (Enter)", style="Primary.TButton", command=self.start_test)
-        self.test_button.pack(side="left", padx=(8, 0))
+        self.clear_question_button = ttk.Button(test, text="清空", command=lambda: self.test_question.set(""))
+        self.clear_question_button.grid(row=1, column=1, sticky="ew", padx=(8, 0))
+        self.test_button = ttk.Button(test, text="提交回答 (Enter)", style="Primary.TButton", command=self.start_test)
+        self.test_button.grid(row=1, column=2, sticky="ew", padx=(8, 0))
         screenshot_hint = ttk.Label(test, textvariable=self.screenshot_notice, style="Card.TLabel", foreground=COLORS["muted"], justify="left")
-        screenshot_hint.pack(fill="x", pady=(8, 0))
+        screenshot_hint.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         test.bind("<Configure>", lambda e: screenshot_hint.configure(wraplength=max(120, e.width - 32)))
         for widget, _ in self.form_controls:
             if str(widget).startswith(str(settings)):
@@ -764,7 +839,17 @@ class EchoMindWindow:
 
     def _pick_caption_click(self, event):
         self.caption_text.focus_set()
+        self.caption_text.mark_set("insert", f"@{event.x},{event.y}")
         return self._toggle_caption_selection(f"@{event.x},{event.y}")
+
+    def _caption_click(self, event):
+        index = self.caption_text.index(f"@{event.x},{event.y}")
+        bounds = self.caption_text.bbox(index)
+        if "caption_checkbox" in self.caption_text.tag_names(index) and bounds:
+            x, y, width, height = bounds
+            if x <= event.x < x + width and y <= event.y < y + height:
+                return self._pick_caption_click(event)
+        self._clear_caption_selection()
 
     def _toggle_caption_selection(self, index):
         start = self.caption_text.index(f"{index} linestart")
@@ -786,7 +871,11 @@ class EchoMindWindow:
     def _caption_selection_changed(self):
         ranges = self.caption_text.tag_ranges("caption_pick")
         count = sum(len(self.caption_text.get(start, end).splitlines()) for start, end in zip(ranges[::2], ranges[1::2]))
-        self.caption_selection_notice.set(f"已选 {count} 条 · Ctrl＋单击取消，Esc 清除" if count else "Ctrl＋单击多选字幕；也可拖选连续文字")
+        self.caption_selection_notice.set(f"已选 {count} 条 · 再次勾选取消，Esc 清除" if count else "勾选多条字幕；也可 Ctrl＋单击或拖选文字")
+        checkboxes = self.caption_text.tag_ranges("caption_checkbox")
+        for start in checkboxes[::2]:
+            selected = "caption_pick" in self.caption_text.tag_names(start)
+            self.caption_text.image_configure(start, image=self.caption_checkbox_images[int(selected)])
 
     def _selected_caption_text(self):
         ranges = self.caption_text.tag_ranges("caption_pick") or self.caption_text.tag_ranges("sel")
@@ -834,30 +923,44 @@ class EchoMindWindow:
         if self.destroyed or self.closing:
             return
         # A custom model is managed by the user, never download Turbo in its place.
-        if self.asr_model_path.get().strip() or self._engine() != "whisper":
+        if self.asr_model_path.get().strip() or self._engine() not in ("whisper", "qwen3-asr-1.7b"):
             return
-        if missing(self.model_path, self.cuda_dir, DEVICE_MODES[self.device.get()]):
+        if self._component_items():
             if self.root.grab_current() is not None:
                 self._component_timer = self.root.after(500, self._first_run_components)
             else:
                 self.open_components()
 
+    def _qwen_runtime_path(self):
+        root = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[3]
+        return resolve_runtime(root, self._selected_model_path())
+
+    def _component_items(self):
+        if self._engine() == "qwen3-asr-1.7b":
+            return missing_qwen(self._selected_model_path(), self._qwen_runtime_path())
+        return missing(self.model_path, self.cuda_dir, DEVICE_MODES[self.device.get()])
+
     def _component_state(self):
-        items = missing(self.model_path, self.cuda_dir, DEVICE_MODES[self.device.get()])
-        details = ("CPU 只需模型；GPU 还需 CUDA 组件及支持 CUDA 的 NVIDIA 显卡和驱动。\n"
+        qwen = self._engine() == "qwen3-asr-1.7b"
+        items = self._component_items()
+        details = ("需要 NVIDIA 显卡及驱动，约 4 GB 显存；无需另装 Python。\n"
+                   "固定版本的官方模型、Python 和 GPU 依赖，均校验 SHA-256。模型源不可达时尝试同版本镜像。\n"
+                   f"模型：{self._selected_model_path()}\n运行环境：{self._qwen_runtime_path()}" if qwen else
+                   "CPU 只需模型；GPU 还需 CUDA 组件及支持 CUDA 的 NVIDIA 显卡和驱动。\n"
                    "下载来自 EchoMind GitHub Release，校验 SHA-256 后安装；不上传音频、字幕或密钥。\n"
                    f"模型：{self.model_path}\nGPU：{self.cuda_dir}")
         if not getattr(sys, "frozen", False):
-            details += "\n开发环境复用 .models 与 .runtime/cuda12，不自动联网下载。"
-        elif items:
+            details += "\n开发环境复用本地部署；需要时可手动准备 Qwen 组件。" if qwen else "\n开发环境复用 .models 与 .runtime/cuda12，不自动联网下载。"
+        if items and (qwen or getattr(sys, "frozen", False)):
             size = sum(item.size for item in items) / 1024**3
             details += f"\n待下载：{'、'.join(item.name for item in items)}，约 {size:.2f} GiB；缓存升级后保留。"
         self.component_details.set(details)
         if not self.downloading_components:
             self.component_notice.set("需要准备语音组件；可稍后下载，先使用文字/截图回答。" if items else "语音组件已就绪，可关闭窗口开始采集。")
         if self.component_dialog is not None:
-            self.component_download_button.configure(state="normal" if items and not self.downloading_components and getattr(sys, "frozen", False) else "disabled")
-            self.component_device_combo.configure(state="disabled" if self.downloading_components else "readonly")
+            self.component_download_button.configure(state="normal" if items and not self.downloading_components and (qwen or getattr(sys, "frozen", False)) else "disabled")
+            self.component_engine_combo.configure(state="disabled" if self.downloading_components else "readonly")
+            self.component_device_combo.configure(state="disabled" if self.downloading_components or qwen else "readonly")
             self.component_close_button.configure(text="取消下载" if self.downloading_components else "关闭")
 
     def open_components(self):
@@ -877,9 +980,14 @@ class EchoMindWindow:
         ttk.Label(frame, text="准备语音识别组件", style="Card.TLabel", font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 16))
         row = ttk.Frame(frame, style="Card.TFrame")
         row.grid(row=1, column=0, sticky="ew", pady=(0, 16))
-        ttk.Label(row, text="识别设备", style="Card.TLabel").pack(side="left", padx=(0, 12))
+        ttk.Label(row, text="识别引擎", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
+        self.component_engine_combo = ttk.Combobox(row, textvariable=self.asr_engine,
+            values=[ENGINE_LABELS[key] for key in ("whisper", "qwen3-asr-1.7b")], state="readonly", width=30)
+        self.component_engine_combo.grid(row=0, column=1, sticky="w", pady=(0, 8))
+        self.component_engine_combo.bind("<<ComboboxSelected>>", lambda _: (self._asr_engine_changed(), self._component_state()))
+        ttk.Label(row, text="Whisper 设备", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 12))
         self.component_device_combo = ttk.Combobox(row, textvariable=self.device, values=list(DEVICE_MODES), state="readonly", width=16)
-        self.component_device_combo.pack(side="left")
+        self.component_device_combo.grid(row=1, column=1, sticky="w")
         self.component_device_combo.bind("<<ComboboxSelected>>", lambda _: self._component_state())
         notice = ttk.Label(frame, textvariable=self.component_notice, style="Card.TLabel", wraplength=540)
         notice.grid(row=2, column=0, sticky="ew", pady=(0, 12))
@@ -914,11 +1022,13 @@ class EchoMindWindow:
         self.component_download_button.focus_set()
 
     def download_components(self):
-        if self.downloading_components or self.updating or not getattr(sys, "frozen", False):
+        if self.downloading_components or self.updating or (not getattr(sys, "frozen", False) and self._engine() != "qwen3-asr-1.7b"):
             return
-        items = missing(self.model_path, self.cuda_dir, DEVICE_MODES[self.device.get()])
+        items = self._component_items()
         if not items:
             return
+        if QWEN_MODEL in items:
+            self.asr_model_path.set("")  # Newly downloaded models live in the shared component cache.
         self.downloading_components = True
         self.component_cancel = threading.Event()
         cancel = self.component_cancel
@@ -1483,6 +1593,13 @@ class EchoMindWindow:
         lines = int(widget.index("end-1c").split(".")[0])
         if lines > 400:
             widget.delete("1.0", f"{lines - 400 + 1}.0")
+        if widget is self.caption_text:
+            for row in range(1, min(lines, 400) + 1):
+                start = f"{row}.0"
+                if "caption_checkbox" not in widget.tag_names(start) and re.match(
+                        r"^\d{2}:\d{2}:\d{2}\s+\S", widget.get(start, f"{start} lineend")):
+                    widget.image_create(start, image=self.caption_checkbox_images[0], align="center")
+                    widget.tag_add("caption_checkbox", start, f"{start}+1c")
         widget.configure(state="disabled")
         if widget is self.caption_text:
             self._caption_selection_changed()
@@ -1519,6 +1636,87 @@ class EchoMindWindow:
         elif self.asr_topic.get() == "前端开发":
             self.asr_hotwords.set(DEFAULT_HOTWORDS)
 
+    def open_hotwords(self):
+        if self.hotwords_dialog is not None and self.hotwords_dialog.winfo_exists():
+            self.hotwords_dialog.lift()
+            self.hotwords_editor.focus_set()
+            return
+        if self.hotwords_button.instate(["disabled"]) or self.root.grab_current() is not None:
+            return
+        dialog = tk.Toplevel(self.root)
+        self.hotwords_dialog = dialog
+        dialog.title("编辑技术热词 · EchoMind")
+        dialog.transient(self.root)
+        dialog.configure(bg=COLORS["surface"])
+        frame = ttk.Frame(dialog, padding=24, style="Card.TFrame")
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+        ttk.Label(frame, text="技术热词", style="Card.TLabel", font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 12))
+        hint = ttk.Label(frame, text="每行一个短术语，也可用中文或英文逗号分隔，最多 500 字。留空关闭热词。\nWhisper、腾讯云支持；Qwen 与其他实验引擎不启用热词。",
+                         style="Card.TLabel", foreground=COLORS["muted"], wraplength=540)
+        hint.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        editor_frame = ttk.Frame(frame, style="Card.TFrame")
+        editor_frame.grid(row=2, column=0, sticky="nsew")
+        editor = self.hotwords_editor = tk.Text(editor_frame, wrap="word", undo=True, width=1, height=1,
+            font=("Microsoft YaHei UI", 11), foreground=COLORS["text"], background=COLORS["surface"],
+            relief="flat", borderwidth=0, padx=8, pady=8, highlightthickness=1,
+            highlightbackground=COLORS["control_border"], highlightcolor=COLORS["primary"])
+        scrollbar = ttk.Scrollbar(editor_frame, command=editor.yview)
+        scrollbar.pack(side="right", fill="y")
+        editor.configure(yscrollcommand=scrollbar.set)
+        editor.pack(fill="both", expand=True)
+        editor.insert("1.0", "\n".join(word.strip() for word in re.split(r"[,，\r\n]+", self.asr_hotwords.get()) if word.strip()))
+        footer = ttk.Label(frame, text="保存后下次启动自动读取，重新开始采集时生效。Ctrl+Enter 保存 · Esc 取消。",
+                           style="Card.TLabel", foreground=COLORS["muted"], wraplength=540)
+        footer.grid(row=3, column=0, sticky="ew", pady=(12, 8))
+        self.hotwords_notice = tk.StringVar(dialog)
+        notice = ttk.Label(frame, textvariable=self.hotwords_notice, style="Card.TLabel", foreground=COLORS["error"], wraplength=540)
+        notice.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        actions = ttk.Frame(frame, style="Card.TFrame")
+        actions.grid(row=5, column=0, sticky="ew")
+
+        def cancel():
+            self.hotwords_dialog = None
+            dialog.destroy()
+            self.hotwords_button.focus_set()
+
+        def save():
+            value = ", ".join(word.strip() for word in re.split(r"[,，\r\n]+", editor.get("1.0", "end-1c")) if word.strip())
+            if len(value) > 500:
+                self.hotwords_notice.set("热词请控制在 500 字以内；请删除部分术语后再保存。")
+                editor.focus_set()
+                return
+            previous = self.asr_hotwords.get()
+            self.asr_hotwords.set(value)
+            if self.save_config():
+                cancel()
+            else:
+                self.asr_hotwords.set(previous)
+                self.hotwords_notice.set(self.config_notice.get())
+                editor.focus_set()
+
+        self.hotwords_clear_button = ttk.Button(actions, text="清空", command=lambda: editor.delete("1.0", "end"))
+        self.hotwords_clear_button.pack(side="left")
+        self.hotwords_save_button = ttk.Button(actions, text="保存", style="Primary.TButton", command=save)
+        self.hotwords_save_button.pack(side="right")
+        self.hotwords_cancel_button = ttk.Button(actions, text="取消", command=cancel)
+        self.hotwords_cancel_button.pack(side="right", padx=(0, 8))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Escape>", lambda _: cancel() or "break")
+        editor.bind("<Control-Return>", lambda _: save() or "break")
+        editor.bind("<Tab>", lambda _: editor.tk_focusNext().focus_set() or "break")
+        editor.bind("<Shift-Tab>", lambda _: editor.tk_focusPrev().focus_set() or "break")
+        frame.bind("<Configure>", lambda event: [label.configure(wraplength=max(160, event.width - 48)) for label in (hint, footer, notice)])
+        dialog.update_idletasks()
+        width = max(540, actions.winfo_reqwidth() + 48)
+        height = frame.winfo_reqheight() + 140
+        dialog.minsize(width, height)
+        dialog.geometry(f"{max(640, width)}x{max(440, height)}")
+        dialog.wait_visibility()
+        dialog.grab_set()
+        editor.focus_set()
+
     def _choose_asr_model(self):
         path = filedialog.askdirectory(parent=self.root, title=f"选择 {self._engine()} 语音模型目录")
         if path:
@@ -1540,7 +1738,7 @@ class EchoMindWindow:
 
     def _engine_hint(self):
         if self._engine() == "qwen3-asr-1.7b":
-            return "本地 GPU 识别，约需 4 GB 显存。自动复用已部署模型和独立运行环境；不自动下载。\n\n停顿后显示确认字幕，不传热词、不做逐字预览。语音检测和异常拦截仍启用。"
+            return "本地 GPU 识别，约需 4 GB 显存。自动复用已部署模型和独立运行环境；缺少时在“设置 → 语音组件”下载。\n\n停顿后显示确认字幕，不传热词、不做逐字预览。语音检测和异常拦截仍启用。"
         if self._engine() == "tencent":
             return "通过腾讯云流式识别，不需要本地模型或 GPU。请先开通语音识别服务；中英模型 16k_zh_en 与通用模型计费不同。凭证随“保存配置”加密保存。断网会停止，不会自动切换引擎。"
         if self._engine() == "whisper":
@@ -1596,6 +1794,9 @@ class EchoMindWindow:
             if self._engine() == "whisper" and not self.asr_model_path.get().strip() and missing(self.model_path, self.cuda_dir, DEVICE_MODES[self.device.get()]):
                 self.open_components()
                 return
+        if question is None and self._engine() == "qwen3-asr-1.7b" and self._component_items():
+            self.open_components()
+            return
         self.error.set("")
         try:
             if question is not None and not question.strip():

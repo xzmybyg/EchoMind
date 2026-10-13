@@ -4,6 +4,47 @@ import math
 import tkinter as tk
 
 
+def _rounded_box(master, size, border, fill, radius, stroke, gap=0, canvas=None):
+    image = tk.PhotoImage(master=master, width=size + gap, height=size)
+    if canvas:
+        image.put(canvas, to=(0, 0, size, size))
+
+    def box(inset, radius, color):
+        extent = size - 2 * inset
+        for row in range(extent):
+            distance = max(radius - row - .5, row + .5 - (extent - radius), 0)
+            corner = max(0, math.ceil(radius - math.sqrt(max(0, radius ** 2 - distance ** 2)) - .5))
+            image.put(color, to=(inset + corner, inset + row, size - inset - corner, inset + row + 1))
+
+    box(0, radius, border)
+    box(stroke, max(0, radius - stroke), fill)
+    return image
+
+
+def button_background(master, scale, border, fill, canvas):
+    """Nine-slice background resized by ttk without stretching corners."""
+    radius = max(3, round(6 * scale))
+    stroke = max(1, round(scale))
+    # ttk tiles the center: a one-pixel center would require thousands of draws.
+    return _rounded_box(master, max(64, round(64 * scale)), border, fill, radius, stroke, canvas=canvas)
+
+
+def checkbox_icon(master, size, border, fill, mark=None, mark_color="white"):
+    """Rounded checkbox indicator with a transparent gap before its label."""
+    scale = size / 16
+    stroke = max(1, round(scale))
+    image = _rounded_box(master, size, border, fill, 3 * scale, stroke, round(8 * scale))
+    if mark:
+        points = [(4, 8), (7, 11), (12, 5)] if mark == "check" else [(4, 8), (12, 8)]
+        for (x1, y1), (x2, y2) in zip(points, points[1:]):
+            steps = max(1, math.ceil(max(abs(x2 - x1), abs(y2 - y1)) * scale))
+            for step in range(steps + 1):
+                x = round((x1 + (x2 - x1) * step / steps) * scale)
+                y = round((y1 + (y2 - y1) * step / steps) * scale)
+                image.put(mark_color, to=(x, y, min(size, x + stroke), min(size, y + stroke)))
+    return image
+
+
 def navigation_icon(master, name, size, color):
     paths = {
         "panel": [(3, 4, 21, 4, 21, 20, 3, 20, 3, 4), (9, 4, 9, 20)],

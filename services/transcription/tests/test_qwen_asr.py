@@ -104,7 +104,14 @@ def test_factory_reuses_session_owned_worker_and_finds_local_assets(tmp_path, mo
     assert create_transcriber(engine="qwen3-asr-1.7b", model_size=folder, local_transcriber=owned) is owned
     python = tmp_path / ".runtime/qwen17-eval/Scripts/python.exe"
     python.parent.mkdir(parents=True)
-    python.touch()
+    python.write_bytes(b"fixture")
+    from echomind.qwen_components import runtime_ready
+    for name in ("torch/__init__.py", "torch/lib/torch_cuda.dll", "transformers/__init__.py",
+                 "librosa/__init__.py", "numpy/__init__.py", "soundfile.py"):
+        path = python.parent.parent / "Lib/site-packages" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+    assert runtime_ready(python.parent.parent)
     # Application root is searched first, so isolate it from the real deployment.
     monkeypatch.setattr("echomind.qwen_asr.__file__", str(tmp_path / "services/transcription/echomind/qwen_asr.py"))
     assert runtime_python(folder) == python

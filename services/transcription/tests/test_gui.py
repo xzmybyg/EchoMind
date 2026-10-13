@@ -198,6 +198,114 @@ def test_speech_topic_choice_controls_session_hotwords_and_custom_words(window):
     assert window.asr_hotwords.get() == ""
 
 
+def test_hotwords_dialog_saves_multiline_and_comma_terms(window):
+    from echomind.settings import load_settings
+    window.asr_hotwords.set("React Fiber, Promise")
+    window.root.deiconify()
+    window.hotwords_button.invoke()
+    dialog = window.hotwords_dialog
+    assert window.hotwords_editor.get("1.0", "end-1c") == "React Fiber\nPromise"
+    window.open_hotwords()
+    assert window.hotwords_dialog is dialog
+    window.hotwords_editor.delete("1.0", "end")
+    window.hotwords_editor.insert("1.0", " Redis， Kafka \nReact Fiber,\n Promise\n")
+    assert window.asr_hotwords.get() == "React Fiber, Promise"
+    window.hotwords_save_button.invoke()
+    expected = "Redis, Kafka, React Fiber, Promise"
+    assert window.hotwords_dialog is None
+    assert window.asr_hotwords.get() == expected
+    assert window.asr_topic.get() == "自定义"
+    assert load_settings(window.settings_path)["asr_hotwords"] == expected
+    window.mode.set("离线演练")
+    assert window._config(text_test=True).asr_hotwords == expected
+
+
+def test_hotwords_cancel_keeps_original_and_clear_can_be_saved(window):
+    from echomind.settings import load_settings
+    window.asr_hotwords.set("Redis, Kafka")
+    window.root.deiconify()
+    window.open_hotwords()
+    window.hotwords_clear_button.invoke()
+    assert window.hotwords_editor.get("1.0", "end-1c") == ""
+    assert window.asr_hotwords.get() == "Redis, Kafka"
+    window.hotwords_cancel_button.invoke()
+    assert window.asr_hotwords.get() == "Redis, Kafka"
+    assert not window.settings_path.exists()
+    window.open_hotwords()
+    window.hotwords_clear_button.invoke()
+    window.hotwords_save_button.invoke()
+    assert window.asr_hotwords.get() == "" and window.asr_topic.get() == "通用"
+    assert load_settings(window.settings_path)["asr_hotwords"] == ""
+
+
+def test_hotwords_limit_and_failed_save_preserve_original_and_draft(window, monkeypatch):
+    from echomind.settings import SettingsError
+    window.asr_hotwords.set("Redis")
+    window.root.deiconify()
+    window.open_hotwords()
+    window.hotwords_editor.delete("1.0", "end")
+    window.hotwords_editor.insert("1.0", "词" * 501)
+    window.hotwords_save_button.invoke()
+    assert "500" in window.hotwords_notice.get()
+    assert window.hotwords_dialog is not None
+    assert window.asr_hotwords.get() == "Redis" and not window.settings_path.exists()
+    window.hotwords_editor.delete("1.0", "end")
+    window.hotwords_editor.insert("1.0", "React Hooks")
+    def fail(*args):
+        raise SettingsError("配置写入失败")
+    monkeypatch.setattr("echomind.gui.save_settings", fail)
+    window.hotwords_save_button.invoke()
+    assert window.hotwords_dialog is not None
+    assert window.asr_hotwords.get() == "Redis"
+    assert window.hotwords_editor.get("1.0", "end-1c") == "React Hooks"
+    assert "配置写入失败" in window.hotwords_notice.get()
+    window.hotwords_cancel_button.invoke()
+
+
+def test_hotwords_dialog_keyboard_save_cancel_and_busy_guard(window):
+    window.root.deiconify()
+    window._busy(True)
+    window.open_hotwords()
+    assert window.hotwords_dialog is None
+    window._busy(False)
+    window.open_hotwords()
+    window.hotwords_editor.delete("1.0", "end")
+    window.hotwords_editor.insert("1.0", "React Hooks\nVue")
+    window.hotwords_editor.focus_force()
+    window.root.update()
+    window.hotwords_editor.event_generate("<Control-Return>")
+    window.root.update()
+    assert window.hotwords_dialog is None
+    assert window.asr_hotwords.get() == "React Hooks, Vue"
+    window.open_hotwords()
+    window.hotwords_editor.insert("end", "\nRedis")
+    window.hotwords_editor.focus_force()
+    window.root.update()
+    window.hotwords_editor.event_generate("<Escape>")
+    window.root.update()
+    assert window.hotwords_dialog is None and window.asr_hotwords.get() == "React Hooks, Vue"
+
+
+@pytest.mark.parametrize("scaling", [1.0, 1.5, 2.0, 3.0])
+def test_hotwords_dialog_controls_fit_and_focus_visible(window, scaling):
+    previous = window.root.tk.call("tk", "scaling")
+    window.root.tk.call("tk", "scaling", scaling)
+    window.root.deiconify()
+    try:
+        window.open_hotwords()
+        dialog = window.hotwords_dialog
+        dialog.geometry(f"{dialog.minsize()[0]}x{dialog.minsize()[1]}")
+        window.root.update()
+        for button in (window.hotwords_clear_button, window.hotwords_cancel_button, window.hotwords_save_button):
+            assert button.winfo_rooty() + button.winfo_height() <= dialog.winfo_rooty() + dialog.winfo_height()
+            assert button.winfo_rootx() + button.winfo_width() <= dialog.winfo_rootx() + dialog.winfo_width()
+        assert window.hotwords_editor.cget("highlightcolor") == COLORS["primary"]
+        assert window.hotwords_editor.bind("<Tab>")
+        window.hotwords_cancel_button.invoke()
+    finally:
+        window.root.tk.call("tk", "scaling", previous)
+
+
 @pytest.mark.parametrize("saved_words", ["", "React Hooks, 自定义术语", "legacy"])
 def test_default_hotword_upgrade_preserves_custom_and_disabled_words(window, monkeypatch, saved_words):
     from echomind.asr import DEFAULT_HOTWORDS, PREVIOUS_DEFAULT_HOTWORDS
@@ -1039,6 +1147,23 @@ def test_desktop_layout_keeps_editor_and_panels_visible(window, geometry):
     bottom = window.test_button.winfo_rooty() + window.test_button.winfo_height()
     assert right <= window.root.winfo_rootx() + window.root.winfo_width()
     assert bottom <= window.root.winfo_rooty() + window.root.winfo_height()
+    upper = (window.import_screenshot_button, window.screenshot_button)
+    lower = (window.clear_question_button, window.test_button)
+    for first, second in zip(upper, lower):
+        assert first.winfo_rootx() == second.winfo_rootx()
+        assert first.winfo_width() == second.winfo_width()
+        assert first.winfo_height() == second.winfo_height()
+    for row in (upper, lower):
+        assert row[0].winfo_rooty() == row[1].winfo_rooty()
+        assert row[0].winfo_width() == row[1].winfo_width()
+        assert row[1].winfo_rootx() - row[0].winfo_rootx() - row[0].winfo_width() == 8
+    assert upper[1].winfo_rooty() + upper[1].winfo_height() + 8 == lower[1].winfo_rooty()
+    assert window.add_caption_button.winfo_rootx() == window.merge_caption_button.winfo_rootx()
+    assert window.add_caption_button.winfo_width() == window.merge_caption_button.winfo_width()
+    assert window.add_caption_button.winfo_height() == window.merge_caption_button.winfo_height()
+    window.test_question.set("待清空的草稿")
+    window.clear_question_button.invoke()
+    assert window.test_question.get() == ""
     window.root.withdraw()
 
 
@@ -1289,6 +1414,88 @@ def test_first_run_only_prompts_when_components_missing(window, monkeypatch, tmp
     assert called == [True]
 
 
+def test_qwen_component_manager_reuses_existing_deployment(window, monkeypatch, tmp_path):
+    from echomind.asr_backends import ENGINE_LABELS
+    from echomind.components import QWEN_MODEL
+    from test_qwen_components import populate_runtime
+    model = tmp_path / "model"
+    model.mkdir()
+    for name in QWEN_MODEL.files:
+        (model / name).write_bytes(b"fixture")
+    runtime = tmp_path / "runtime"
+    populate_runtime(runtime)
+    window.asr_engine.set(ENGINE_LABELS["qwen3-asr-1.7b"])
+    window.asr_model_path.set(str(model))
+    monkeypatch.setattr(window, "_qwen_runtime_path", lambda: runtime)
+    monkeypatch.setattr("echomind.gui.install_components", lambda *a, **k: pytest.fail("must reuse"))
+    window.root.deiconify()
+    window.open_components()
+    assert window._component_items() == []
+    assert "已就绪" in window.component_notice.get()
+    assert str(window.component_download_button.cget("state")) == "disabled"
+    assert str(window.component_device_combo.cget("state")) == "disabled"
+    assert "无需另装 Python" in window.component_details.get()
+    window.download_components()
+    window.component_close_button.invoke()
+
+
+def test_missing_qwen_prepares_only_qwen_and_supports_manual_development_download(window, monkeypatch, tmp_path):
+    from echomind.asr_backends import ENGINE_LABELS
+    from echomind.components import QWEN_MODEL, QWEN_RUNTIME
+    import time
+    window.asr_engine.set(ENGINE_LABELS["qwen3-asr-1.7b"])
+    window.asr_model_path.set(str(tmp_path / "missing-model"))
+    monkeypatch.setattr(window, "_qwen_runtime_path", lambda: tmp_path / "missing-runtime")
+    seen = []
+    monkeypatch.setattr("echomind.gui.install_components", lambda items, **kwargs: seen.extend(items))
+    window.root.deiconify()
+    window.open_components()
+    assert "7.17 GiB" in window.component_details.get()
+    assert str(window.component_download_button.cget("state")) == "normal"
+    window.component_download_button.invoke()
+    assert str(window.component_engine_combo.cget("state")) == "disabled"
+    deadline = time.monotonic() + 5
+    while window.downloading_components and time.monotonic() < deadline:
+        window.root.update()
+        time.sleep(0.01)
+    assert seen == [QWEN_MODEL, QWEN_RUNTIME]
+    assert not window.asr_model_path.get()
+    assert not window.downloading_components
+    window.component_close_button.invoke()
+
+
+def test_qwen_start_opens_component_manager_if_runtime_missing(window, monkeypatch):
+    from echomind.asr_backends import ENGINE_LABELS
+    from echomind.components import QWEN_RUNTIME
+    window.asr_engine.set(ENGINE_LABELS["qwen3-asr-1.7b"])
+    monkeypatch.setattr(window, "_component_items", lambda: [QWEN_RUNTIME])
+    called = []
+    monkeypatch.setattr(window, "open_components", lambda: called.append(True))
+    window.start_capture()
+    assert called == [True] and window.session is None
+
+
+@pytest.mark.parametrize("scaling", [1.0, 1.5, 2.0, 3.0])
+def test_qwen_component_controls_visible_at_high_dpi(window, scaling, monkeypatch, tmp_path):
+    from echomind.asr_backends import ENGINE_LABELS
+    previous = window.root.tk.call("tk", "scaling")
+    window.root.tk.call("tk", "scaling", scaling)
+    window.asr_engine.set(ENGINE_LABELS["qwen3-asr-1.7b"])
+    window.asr_model_path.set(str(tmp_path / "model"))
+    monkeypatch.setattr(window, "_qwen_runtime_path", lambda: tmp_path / "runtime")
+    window.root.deiconify()
+    try:
+        window.open_components()
+        window.root.update()
+        dialog = window.component_dialog
+        for widget in (window.component_engine_combo, window.component_download_button, window.component_close_button):
+            assert widget.winfo_rooty() + widget.winfo_height() <= dialog.winfo_rooty() + dialog.winfo_height()
+            assert widget.winfo_rootx() + widget.winfo_width() <= dialog.winfo_rootx() + dialog.winfo_width()
+        window.component_close_button.invoke()
+    finally:
+        window.root.tk.call("tk", "scaling", previous)
+
+
 @pytest.mark.parametrize("scaling", [1.0, 1.5, 2.0, 3.0])
 def test_follow_settings_cancel_and_save(window, scaling):
     from echomind.settings import load_settings
@@ -1504,6 +1711,50 @@ def test_missing_caption_selection_preserves_draft(window):
     window.add_selected_caption()
     assert "拖选" in window.error.get()
     assert window.test_question.get() == "已有草稿"
+
+
+def test_caption_checkboxes_click_to_select_and_merge_without_ctrl(window):
+    window.root.geometry("1040x740+30+30")
+    window.root.deiconify()
+    window._write(window.caption_text, "01:55:07  设计一个灰度发布方案\n01:55:08  好的\n01:55:11  支持逐步放量\n")
+    window.root.update_idletasks()
+    text = window.caption_text
+    for row in (1, 3):
+        text.see(f"{row}.0")
+        window.root.update()
+        x, y, width, height = text.bbox(f"{row}.0")
+        text.event_generate("<Button-1>", x=x + width // 2, y=y + height // 2)
+        text.event_generate("<ButtonRelease-1>", x=x + width // 2, y=y + height // 2)
+        assert text.image_cget(f"{row}.0", "image") == str(window.caption_checkbox_images[1])
+    assert "已选 2 条" in window.caption_selection_notice.get()
+    text.event_generate("<Button-1>", x=x + width // 2, y=y + height // 2)
+    assert "已选 1 条" in window.caption_selection_notice.get()
+    assert text.image_cget("3.0", "image") == str(window.caption_checkbox_images[0])
+    text.focus_force()
+    window.root.update()
+    text.event_generate("<Control-space>")
+    assert "已选 2 条" in window.caption_selection_notice.get()
+    window.merge_caption_button.invoke()
+    assert window.test_question.get() == "设计一个灰度发布方案 支持逐步放量"
+    assert not text.tag_ranges("caption_pick")
+    assert all(text.image_cget(f"{row}.0", "image") == str(window.caption_checkbox_images[0]) for row in (1, 2, 3))
+    assert text.cget("state") == "disabled" and window.session is None
+
+
+def test_caption_checkbox_updates_without_duplicates_and_can_be_cleared(window):
+    text = window.caption_text
+    window._write(text, "01:55:07  解释一下React Fiber\n  音频复识别前：React Fibr\n")
+    window._toggle_caption_selection("1.0")
+    window._write(text, "01:55:11  原理。\n")
+    assert len(text.image_names()) == 2
+    assert "caption_checkbox" not in text.tag_names("2.0")
+    assert text.image_cget("1.0", "image") == str(window.caption_checkbox_images[1])
+    assert text.image_cget("3.0", "image") == str(window.caption_checkbox_images[0])
+    window._clear_caption_selection()
+    assert text.image_cget("1.0", "image") == str(window.caption_checkbox_images[0])
+    window._write(text, "01:56:00  新的提问\n", replace=True)
+    assert len(text.image_names()) == 1
+    assert "新的提问" in text.get("1.0", "end") and not text.tag_ranges("caption_pick")
 
 
 def test_selected_captions_merge_in_display_order_without_unselected_lines(window):

@@ -33,10 +33,11 @@ class Component:
     extracted_size: int
     folder: str
     files: tuple[str, ...]
+    source_url: str = ""
 
     @property
     def url(self):
-        return f"https://github.com/xzmybyg/EchoMind/releases/download/v0.1.1/{self.archive}"
+        return self.source_url or f"https://github.com/xzmybyg/EchoMind/releases/download/v0.1.1/{self.archive}"
 
 
 MODEL = Component("中文识别模型", "EchoMind-v0.1.1-model.zip",
@@ -49,6 +50,12 @@ GPU = Component("GPU 组件", "EchoMind-v0.1.1-cuda.zip",
                 ("cublas64_12.dll", "cublasLt64_12.dll", "cudnn_adv64_9.dll", "cudnn_cnn64_9.dll",
                  "cudnn_engines_precompiled64_9.dll", "cudnn_engines_runtime_compiled64_9.dll",
                  "cudnn_graph64_9.dll", "cudnn_heuristic64_9.dll", "cudnn_ops64_9.dll", "cudnn64_9.dll"))
+QWEN_MODEL = Component("Qwen3-ASR 1.7B 模型", "qwen3-asr-1.7b", "", 4087628216,
+                       4087628216, "models/qwen3-asr-1.7b",
+                       ("config.json", "generation_config.json", "model.safetensors", "processor_config.json",
+                        "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"))
+QWEN_RUNTIME = Component("Qwen 独立 GPU 环境", "qwen17-runtime", "", 3612954953,
+                         8 * 1024**3, "runtime/qwen17-eval", ("python.exe", ".qwen-ready.json"))
 
 
 def cache_root() -> Path:
@@ -171,6 +178,10 @@ def install_components(items, *, directory=None, progress=lambda text, percent: 
                     raise ComponentError("另一 EchoMind 窗口正在准备组件，请稍后重试。") from exc
             for item in items:
                 _check_cancel(cancel)
+                if item in (QWEN_MODEL, QWEN_RUNTIME):
+                    from .qwen_components import install_qwen
+                    install_qwen(item, directory, client, progress, cancel)
+                    continue
                 target = directory / item.folder
                 if ready(target, item):
                     continue

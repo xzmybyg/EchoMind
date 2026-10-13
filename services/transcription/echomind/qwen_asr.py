@@ -18,15 +18,12 @@ class QwenASRError(RuntimeError):
 
 
 def runtime_python(model_path):
-    from .components import cache_root
+    from .qwen_components import resolve_runtime, runtime_executable, runtime_ready
     app = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[3]
-    roots = [app, *Path(model_path).resolve().parents[:4], cache_root()]
-    candidates = [root / name / "qwen17-eval/Scripts/python.exe"
-                  for root in roots for name in (".runtime", "runtime")]
-    for path in candidates:
-        if path.is_file():
-            return path
-    raise QwenASRError("未找到 Qwen 独立运行环境，请保留项目中的 .runtime/qwen17-eval，或将它部署到程序旁 runtime/qwen17-eval。")
+    folder = resolve_runtime(app, model_path)
+    if runtime_ready(folder):
+        return runtime_executable(folder)
+    raise QwenASRError("未找到完整的 Qwen 独立运行环境，请打开“设置 → 语音组件”，选择 Qwen3-ASR 1.7B 下载并准备。")
 
 
 class QwenTranscriber(Transcriber):

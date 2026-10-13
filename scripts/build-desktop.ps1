@@ -41,6 +41,7 @@ $arguments = @(
     '--add-data', ((Join-Path $repo 'services\transcription\echomind\windows_ocr.ps1') + ';echomind'),
     '--add-data', ((Join-Path $repo 'services\transcription\echomind\windows_update.ps1') + ';echomind'),
     '--add-data', ((Join-Path $repo 'services\transcription\echomind\qwen_worker.py') + ';echomind'),
+    '--add-data', ((Join-Path $repo 'services\transcription\echomind\qwen_components.json') + ';echomind'),
     '--copy-metadata', 'faster-whisper', '--copy-metadata', 'ctranslate2',
     '--copy-metadata', 'av', '--copy-metadata', 'tokenizers',
     (Join-Path $PSScriptRoot 'desktop-entry.pyw')

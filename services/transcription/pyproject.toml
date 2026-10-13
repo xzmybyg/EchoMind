@@ -25,3 +25,6 @@ asr-onnx = ["sherpa-onnx==1.13.3"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["echomind*"]
+
+[tool.setuptools.package-data]
+echomind = ["qwen_components.json"]
