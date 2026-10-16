@@ -64,7 +64,7 @@ def _unprotect_secret(value: str) -> str:
 
 
 def _validate(settings: Mapping[str, str | bool | float]) -> dict[str, str | bool | float]:
-    allowed = {*_TEXT_FIELDS, *_SECRET_FIELDS, "jev_enabled", "follow_enabled", "question_threshold"}
+    allowed = {*_TEXT_FIELDS, *_SECRET_FIELDS, "jev_enabled", "follow_enabled", "question_threshold", "knowledge_enabled"}
     if not isinstance(settings, Mapping) or set(settings) - allowed:
         raise ValueError("invalid settings fields")
     result = dict(settings)
@@ -72,7 +72,7 @@ def _validate(settings: Mapping[str, str | bool | float]) -> dict[str, str | boo
         if key == "question_threshold":
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError("invalid question threshold")
-        elif key in ("jev_enabled", "follow_enabled"):
+        elif key in ("jev_enabled", "follow_enabled", "knowledge_enabled"):
             if not isinstance(value, bool):
                 raise ValueError("invalid setting type")
         elif not isinstance(value, str):

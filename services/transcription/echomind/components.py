@@ -178,6 +178,10 @@ def install_components(items, *, directory=None, progress=lambda text, percent: 
                     raise ComponentError("另一 EchoMind 窗口正在准备组件，请稍后重试。") from exc
             for item in items:
                 _check_cancel(cancel)
+                from .knowledge_model import KNOWLEDGE_MODEL, install_model
+                if item == KNOWLEDGE_MODEL:
+                    install_model(directory, client, progress, cancel)
+                    continue
                 if item in (QWEN_MODEL, QWEN_RUNTIME):
                     from .qwen_components import install_qwen
                     install_qwen(item, directory, client, progress, cancel)

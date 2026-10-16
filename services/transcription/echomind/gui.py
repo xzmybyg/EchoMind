@@ -30,14 +30,16 @@ from .updater import UpdateError, check_release, launch_installer, stage_update
 from .version import VERSION
 from .window_follow import WindowsAPI, WindowFollower, process_family
 from .gui_icons import button_background, checkbox_icon, navigation_icon
+from .knowledge import KnowledgeHit
+from .knowledge_model import KNOWLEDGE_MODEL, model_ready as knowledge_model_ready
 
 
-COLORS = {"background": "#F5F5F5", "surface": "#FFFFFF", "text": "#141414",
-          "muted": "#595959", "primary": "#1677FF", "border": "#D9D9D9",
-          "tint": "#E6F4FF", "active": "#0958D9", "error": "#B42318",
-          "control_border": "#8C8C8C", "disabled": "#737373", "table_header": "#FAFAFA",
-          "pressed": "#003EB3", "rail": "#F3F0EB", "rail_hover": "#E9E5DF",
-          "rail_selected": "#E0DCD5"}
+COLORS = {"background": "#FAF9F6", "surface": "#FFFFFF", "text": "#24211E",
+          "muted": "#6F6961", "primary": "#7A6046", "border": "#E5DFD6",
+          "tint": "#F0E9DF", "active": "#201E1B", "error": "#B42318",
+          "control_border": "#B4AAA0", "disabled": "#9A948C", "table_header": "#F7F4EF",
+          "pressed": "#3C3731", "rail": "#F5F2EC", "rail_hover": "#ECE6DD",
+          "rail_selected": "#FFFFFF"}
 ANSWER_MODES = {"仅字幕": "off", "离线演练": "demo", "DeepSeek 在线回答": "live"}
 DEVICE_MODES = {"GPU（推荐）": "cuda", "CPU（较慢）": "cpu"}
 MODE_HINTS = {"仅字幕": "仅显示字幕，不生成回答。是否上传音频取决于“语音”页选择的识别引擎。",
@@ -52,6 +54,8 @@ class QuestionRecord:
     answer: str = ""
     status: str = "生成中"
     metrics: str = "正在生成回答…"
+    sources: tuple[KnowledgeHit, ...] = ()
+    retrieval_ms: float | None = None
 
 
 def asset_paths() -> tuple[Path, Path, Path]:
@@ -83,6 +87,7 @@ class EchoMindWindow:
         self.closing = False
         self.destroyed = False
         self.refreshing = False
+        self.capture_after_refresh = False
         self.importing_screenshot = False
         self.screenshot_notice = tk.StringVar(value="截图后 Ctrl+V 粘贴；本机识别，核对后提交。")
         self.processes: dict[str, int] = {}
@@ -145,6 +150,11 @@ class EchoMindWindow:
         self.api_key = tk.StringVar(value=os.environ.get("ECHOMIND_LLM_API_KEY", saved.get("api_key", "")))
         self.jev_key = tk.StringVar(value=os.environ.get("ECHOMIND_JEV_API_KEY", saved.get("jev_key", "")))
         self.jev = tk.BooleanVar(value=saved.get("jev_enabled", False))
+        self.knowledge_enabled = tk.BooleanVar(value=saved.get("knowledge_enabled", False))
+        self.knowledge_window = None
+        self.answer_sources = ()
+        self.retrieval_ms = None
+        self.component_kind = tk.StringVar()
         self.jev_threshold = tk.StringVar(value=f"{saved.get('question_threshold', 0.85) * 100:g}")
         self.show_keys = tk.BooleanVar(value=False)
         self.test_question = tk.StringVar()
@@ -196,15 +206,15 @@ class EchoMindWindow:
         style.configure("Card.TLabel", background=COLORS["surface"])
         style.configure("Muted.TLabel", foreground=COLORS["muted"])
         style.configure("Error.TLabel", foreground=COLORS["error"])
-        style.configure("Badge.TLabel", background=COLORS["tint"], foreground=COLORS["active"], padding=(12, 6))
-        style.configure("Hint.TLabel", background=COLORS["tint"], foreground=COLORS["muted"], padding=12)
-        style.configure("TButton", padding=(12, 6), background=COLORS["surface"], relief="flat",
+        style.configure("Badge.TLabel", background=COLORS["tint"], foreground=COLORS["primary"], padding=(12, 8))
+        style.configure("Hint.TLabel", background=COLORS["table_header"], foreground=COLORS["muted"], padding=12)
+        style.configure("TButton", padding=(14, 7), background=COLORS["surface"], relief="flat",
                         borderwidth=1, bordercolor=COLORS["control_border"],
                         lightcolor=COLORS["surface"], darkcolor=COLORS["surface"], focuscolor=COLORS["primary"])
         style.map("TButton", background=[("disabled", COLORS["background"]), ("pressed", COLORS["tint"]), ("active", COLORS["surface"])],
                   foreground=[("disabled", COLORS["disabled"]), ("active", COLORS["active"])],
                   bordercolor=[("focus", COLORS["primary"]), ("active", COLORS["primary"])])
-        # Darker Ant blue keeps normal-sized white action text readable.
+        # Warm monochrome actions keep white labels readable in every state.
         style.configure("Primary.TButton", background=COLORS["active"], foreground="white", bordercolor=COLORS["active"], focuscolor="white")
         style.map("Primary.TButton", background=[("disabled", COLORS["background"]), ("pressed", COLORS["pressed"]), ("active", COLORS["pressed"])],
                   foreground=[("disabled", COLORS["disabled"]), ("!disabled", "white")],
@@ -221,14 +231,14 @@ class EchoMindWindow:
                   bordercolor=[("focus", COLORS["primary"])])
         style.configure("Text.TButton", foreground=COLORS["active"])
         style.map("Text.TButton", foreground=[("disabled", COLORS["disabled"]), ("!disabled", COLORS["active"])])
-        # All button roles share rounded corners, spacing and native ttk bindings.
+        # Nine-slice surfaces preserve native ttk bindings and scale at any DPI.
         scale = max(1, float(self.root.tk.call("tk", "scaling")) / (96 / 72))
         host = self.root._root()
         if not hasattr(host, "_button_images"):
             host._button_images = {}
         c = COLORS
         button_colors = {
-            "TButton": [(c["control_border"], c["surface"]), (c["primary"], c["surface"]),
+            "TButton": [(c["border"], c["surface"]), (c["control_border"], c["table_header"]),
                         (c["active"], c["tint"]), (c["border"], c["background"])],
             "Primary.TButton": [(c["active"], c["active"]), (c["pressed"], c["pressed"]),
                                 (c["pressed"], c["pressed"]), (c["border"], c["background"])],
@@ -240,19 +250,20 @@ class EchoMindWindow:
                              (c["rail_selected"], c["rail_selected"]), (c["rail"], c["rail"])],
         }
         for name, colors in button_colors.items():
-            element = f"Ant{round(6 * scale)}.{name}.border"
+            radius = 10 if name == "Rail.TButton" else 14
+            element = f"Warm{round(radius * scale)}.{name}.border"
             focus_fill = c["tint"] if name == "Dropdown.TButton" else colors[0][1]
             if element not in style.element_names():
                 # Opaque corners mask ttk's state-colored widget background.
                 canvas = c["rail"] if name == "Rail.TButton" else c["surface"]
-                normal, hover, pressed, disabled = [button_background(self.root, scale, *pair, canvas) for pair in colors]
-                focus = button_background(self.root, scale, c["primary"], focus_fill, canvas)
+                normal, hover, pressed, disabled = [button_background(self.root, scale, *pair, canvas, radius=radius) for pair in colors]
+                focus = button_background(self.root, scale, c["primary"], focus_fill, canvas, radius=radius)
                 host._button_images[element] = (normal, hover, pressed, disabled, focus)
                 states = [("disabled", disabled), ("pressed", pressed), ("focus", focus), ("active", hover)]
                 if name == "Rail.TButton":
                     states.insert(1, ("selected", pressed))
                 style.element_create(element, "image", normal, *states,
-                                     border=round(6 * scale) + max(1, round(scale)),
+                                     border=round(radius * scale) + max(1, round(scale)),
                                      padding=max(1, round(scale)), width=0, height=0, sticky="nswe")
             backgrounds = [("disabled", colors[3][1]), ("pressed", colors[2][1]),
                            ("focus", focus_fill), ("active", colors[1][1])]
@@ -263,6 +274,13 @@ class EchoMindWindow:
                 ("Button.padding", {"sticky": "nswe", "children": [
                     ("Button.focus", {"sticky": "nswe", "children": [
                         ("Button.label", {"sticky": "nswe"})]})]})]})])
+        panel_element = f"WarmPanel{round(14 * scale)}.border"
+        if panel_element not in style.element_names():
+            panel_image = button_background(self.root, scale, c["border"], c["surface"], c["background"])
+            host._button_images[panel_element] = (panel_image,)
+            style.element_create(panel_element, "image", panel_image, border=round(14 * scale) + 1,
+                                 padding=0, sticky="nswe")
+        style.layout("Panel.TFrame", [(panel_element, {"sticky": "nswe"})])
         style.configure("TEntry", padding=(8, 6), borderwidth=1, bordercolor=COLORS["control_border"],
                         lightcolor=COLORS["surface"], darkcolor=COLORS["surface"], fieldbackground=COLORS["surface"])
         style.map("TEntry", bordercolor=[("focus", COLORS["primary"])],
@@ -272,6 +290,26 @@ class EchoMindWindow:
         style.map("TCombobox", fieldbackground=[("readonly", COLORS["surface"])],
                   background=[("readonly", COLORS["surface"])], bordercolor=[("focus", COLORS["primary"])],
                   foreground=[("disabled", COLORS["disabled"]), ("readonly", COLORS["text"])])
+        # Reuse native text areas/arrows, replacing only the square field outline.
+        field_element = f"WarmField{round(8 * scale)}.border"
+        if field_element not in style.element_names():
+            normal, focused, disabled = [button_background(self.root, scale, border, fill, c["surface"], radius=8)
+                                        for border, fill in ((c["border"], c["surface"]),
+                                                             (c["primary"], c["surface"]),
+                                                             (c["border"], c["table_header"]))]
+            host._button_images[field_element] = (normal, focused, disabled)
+            style.element_create(field_element, "image", normal, ("disabled", disabled), ("focus", focused),
+                                 border=round(8 * scale) + 1, padding=max(1, round(scale)), width=0, height=0, sticky="nswe")
+        style.layout("TEntry", [(field_element, {"sticky": "nswe", "children": [
+            ("Entry.padding", {"sticky": "nswe", "children": [("Entry.textarea", {"sticky": "nswe"})]})]})])
+        style.layout("TCombobox", [(field_element, {"sticky": "nswe", "children": [
+            ("Combobox.downarrow", {"side": "right", "sticky": "ns"}),
+            ("Combobox.padding", {"sticky": "nswe", "children": [("Combobox.textarea", {"sticky": "nswe"})]})]})])
+        style.configure("TSpinbox", padding=(8, 6), bordercolor=c["border"], fieldbackground=c["surface"],
+                        background=c["surface"], arrowcolor=c["muted"])
+        style.map("TSpinbox", bordercolor=[("focus", c["primary"])])
+        style.configure("TSeparator", background=c["border"])
+        style.configure("Horizontal.TProgressbar", background=c["primary"], troughcolor=c["tint"], borderwidth=0)
         # Keep ttk's checkbox bindings and label focus; replace only its indicator.
         indicator_size = max(16, round(12 * float(self.root.tk.call("tk", "scaling"))))
         indicator = f"AntCheck{indicator_size}.indicator"
@@ -302,23 +340,31 @@ class EchoMindWindow:
         style.map("TCheckbutton", background=[("!disabled", COLORS["surface"]), ("disabled", COLORS["surface"])],
                   foreground=[("disabled", COLORS["disabled"])])
         self.caption_checkbox_images = self.root._root()._checkbox_images[indicator][0:3:2]
-        style.configure("TNotebook", background=COLORS["surface"], borderwidth=0, tabmargins=(0, 0, 0, 1))
-        # Omit the theme's raised tab border and selected-only padding.
-        style.layout("TNotebook.Tab", [("Notebook.padding", {"sticky": "nswe", "children": [
-            ("Notebook.focus", {"sticky": "nswe", "children": [
-                ("Notebook.label", {"sticky": "nswe"})]})]})])
+        style.configure("TNotebook", background=COLORS["background"], borderwidth=0, tabmargins=(4, 0, 4, 8),
+                        bordercolor=c["background"], lightcolor=c["background"], darkcolor=c["background"])
+        # Equal-size rounded tabs avoid the native theme's raised active border.
         style.configure("TNotebook.Tab", padding=(12, 10), width=8, anchor="center",
                         background=COLORS["surface"], focuscolor=COLORS["primary"])
+        tab_element = f"WarmTab{round(10 * scale)}.border"
+        if tab_element not in style.element_names():
+            normal, selected = [button_background(self.root, scale, border, fill, c["background"], radius=10)
+                                for border, fill in ((c["background"], c["background"]), (c["border"], c["surface"]))]
+            focus = button_background(self.root, scale, c["primary"], c["surface"], c["background"], radius=10)
+            host._button_images[tab_element] = (normal, selected, focus)
+            style.element_create(tab_element, "image", normal, ("focus", focus), ("selected", selected),
+                                 border=round(10 * scale) + 1, padding=0, width=0, height=0, sticky="nswe")
+        style.layout("TNotebook.Tab", [(tab_element, {"sticky": "nswe", "children": [
+            ("Notebook.padding", {"sticky": "nswe", "children": [("Notebook.label", {"sticky": "nswe"})]})]})])
         style.layout("Settings.TNotebook.Tab", [])
-        style.configure("Settings.TNotebook", bordercolor=COLORS["surface"],
+        style.configure("Settings.TNotebook", background=COLORS["surface"], tabmargins=(0, 0, 0, 0), bordercolor=COLORS["surface"],
                         lightcolor=COLORS["surface"], darkcolor=COLORS["surface"])
-        style.map("TNotebook.Tab", padding=[], background=[("selected", COLORS["tint"]), ("active", COLORS["background"])],
-                  foreground=[("selected", COLORS["active"]), ("active", COLORS["active"])])
+        style.map("TNotebook.Tab", padding=[], background=[("selected", COLORS["surface"]), ("active", COLORS["background"])],
+                  foreground=[("selected", COLORS["text"]), ("active", COLORS["text"]), ("!selected", COLORS["muted"])])
         style.layout("Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
             ("Vertical.Scrollbar.thumb", {"sticky": "nswe"})]})])
-        style.configure("Vertical.TScrollbar", background=COLORS["control_border"], troughcolor=COLORS["surface"],
+        style.configure("Vertical.TScrollbar", background=COLORS["border"], troughcolor=COLORS["surface"],
                         bordercolor=COLORS["surface"], lightcolor=COLORS["surface"], darkcolor=COLORS["surface"],
-                        borderwidth=0, relief="flat", arrowsize=10, gripcount=0, sliderlength=24)
+                        borderwidth=0, relief="flat", arrowsize=8, gripcount=0, sliderlength=24)
         style.map("Vertical.TScrollbar", background=[("pressed", COLORS["muted"]), ("active", COLORS["muted"])])
         style.configure("TPanedwindow", background=COLORS["background"], sashwidth=12)
         style.configure("Treeview", rowheight=tkfont.Font(font=("Microsoft YaHei UI", 10)).metrics("linespace") + 10,
@@ -328,11 +374,11 @@ class EchoMindWindow:
         style.map("Treeview", background=[("selected", COLORS["tint"])], foreground=[("selected", COLORS["active"])])
         self.full_view = ttk.Frame(self.root)
         self.full_view.pack(fill="both", expand=True)
-        self.navigation_rail = ttk.Frame(self.full_view, style="Rail.TFrame", padding=(6, 12))
+        self.navigation_rail = ttk.Frame(self.full_view, style="Rail.TFrame", padding=(8, 16))
         self.navigation_rail.pack(side="left", fill="y")
         icon_size = max(20, round(tkfont.Font(font=("Microsoft YaHei UI", 10)).metrics("linespace") * 1.2))
         self.navigation_icons = {name: navigation_icon(self.root, name, icon_size, COLORS["muted"])
-                                 for name in ("panel", "basic", "speech", "model", "jev", "settings", "shortcut", "follow", "update", "component")}
+                                 for name in ("panel", "basic", "speech", "model", "jev", "settings", "shortcut", "follow", "update", "component", "knowledge")}
         self.sidebar_collapsed = False
         self.sidebar_toggle = ttk.Button(self.navigation_rail, text="收起", image=self.navigation_icons["panel"],
                                          compound="top", style="Rail.TButton", command=self.toggle_sidebar)
@@ -344,33 +390,34 @@ class EchoMindWindow:
             button.pack(fill="x", pady=4)
             button.bind("<Return>", self._settings_select_key)
             self.navigation_buttons.append(button)
+        self.knowledge_button = ttk.Button(self.navigation_rail, text="知识库", image=self.navigation_icons["knowledge"],
+            compound="top", style="Rail.TButton", command=self.open_knowledge)
+        self.knowledge_button.pack(fill="x", pady=(16, 4))
         outer = ttk.Frame(self.full_view, padding=16)
         outer.pack(side="left", fill="both", expand=True)
         header = ttk.Frame(outer)
-        header.pack(fill="x", pady=(0, 12))
-        tk.Label(header, text="E", bg=COLORS["active"], fg="white", font=("Segoe UI", 16, "bold"),
-                 padx=12, pady=4).pack(side="left", padx=(0, 12))
+        header.pack(fill="x", pady=(0, 16))
         brand = ttk.Frame(header)
         brand.pack(side="left")
-        ttk.Label(brand, text="EchoMind", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(brand, text="EchoMind · 会议工作台", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w", pady=(0, 4))
         ttk.Label(brand, text="听清问题 · 梳理思路", style="Muted.TLabel").pack(anchor="w")
         ttk.Label(header, textvariable=self.status, style="Badge.TLabel", wraplength=420).pack(side="right")
         body = ttk.Frame(outer)
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
-        sidebar = ttk.Frame(body, style="Panel.TFrame", width=280)
+        sidebar = ttk.Frame(body, style="Panel.TFrame", width=280, padding=(8, 12))
         self.sidebar = sidebar
         sidebar.grid(row=0, column=0, sticky="ns", padx=(0, 16))
         sidebar.grid_propagate(False)
         sidebar.columnconfigure(0, weight=1)
         sidebar.rowconfigure(0, weight=1)
-        self.settings_canvas = tk.Canvas(sidebar, bg=COLORS["surface"], highlightthickness=0, width=270)
+        self.settings_canvas = tk.Canvas(sidebar, bg=COLORS["surface"], highlightthickness=0, width=254)
         settings_scroll = ttk.Scrollbar(sidebar, orient="vertical", command=self.settings_canvas.yview)
         settings_scroll.grid(row=0, column=1, sticky="ns")
         self.settings_canvas.grid(row=0, column=0, sticky="nsew")
         self.settings_canvas.configure(yscrollcommand=settings_scroll.set)
-        settings = ttk.Frame(self.settings_canvas, padding=16, style="Card.TFrame")
+        settings = ttk.Frame(self.settings_canvas, padding=(8, 4, 8, 12), style="Card.TFrame")
         self.settings_window = self.settings_canvas.create_window(0, 0, window=settings, anchor="nw")
         settings.bind("<Configure>", lambda event: self.settings_canvas.configure(scrollregion=self.settings_canvas.bbox("all")))
         self.settings_canvas.bind("<Configure>", lambda event: self.settings_canvas.itemconfigure(self.settings_window, width=event.width))
@@ -493,7 +540,7 @@ class EchoMindWindow:
         main.grid(row=0, column=1, sticky="nsew")
         main.columnconfigure(0, weight=1)
         main.rowconfigure(2, weight=1)
-        toolbar = ttk.Frame(main, style="Panel.TFrame", padding=12)
+        toolbar = ttk.Frame(main, style="Panel.TFrame", padding=16)
         self.capture_toolbar = toolbar
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         source_row = ttk.Frame(toolbar, style="Card.TFrame")
@@ -521,13 +568,17 @@ class EchoMindWindow:
                                 foreground=COLORS["muted"])
         follow_label.pack(side="right", padx=(16, 0))
         details.bind("<Configure>", lambda e: [label.configure(wraplength=max(120, (e.width - 16) // 2)) for label in (shortcut_label, follow_label)])
-        ttk.Label(main, textvariable=self.error, style="Error.TLabel", wraplength=660).grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        error_label = ttk.Label(main, textvariable=self.error, style="Error.TLabel", wraplength=660)
+        error_label.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.error.trace_add("write", lambda *_: error_label.grid() if self.error.get() else error_label.grid_remove())
+        if not self.error.get():
+            error_label.grid_remove()
         panels = ttk.Panedwindow(main, orient="horizontal")
         panels.grid(row=2, column=0, sticky="nsew")
-        captions = ttk.Frame(panels, style="Panel.TFrame", padding=12)
+        captions = ttk.Frame(panels, style="Panel.TFrame", padding=16)
         self.answer_tabs = ttk.Notebook(panels)
-        answers = ttk.Frame(self.answer_tabs, style="Card.TFrame", padding=12)
-        history = ttk.Frame(self.answer_tabs, style="Card.TFrame", padding=12)
+        answers = ttk.Frame(self.answer_tabs, style="Panel.TFrame", padding=16)
+        history = ttk.Frame(self.answer_tabs, style="Panel.TFrame", padding=16)
         self.answer_tabs.add(answers, text="当前回答")
         self.answer_tabs.add(history, text="问题记录")
         panels.add(captions, weight=2)
@@ -571,6 +622,12 @@ class EchoMindWindow:
         captions.bind("<Configure>", lambda e: partial_label.configure(wraplength=max(120, e.width - 56)))
         answers.bind("<Configure>", lambda e: [label.configure(wraplength=max(120, e.width - 56)) for label in (question_label, metrics_label, detection_label)])
         self.answer_text = self._text(answers)
+        self.sources_button = ttk.Button(answers, text="参考资料（0）", style="Text.TButton", command=self._toggle_sources)
+        self.sources_button.pack(fill="x", before=self.answer_text.master)
+        self.sources_button.pack_forget()
+        self.sources_panel = ttk.Frame(answers, style="Card.TFrame")
+        self.sources_text = self._text(self.sources_panel)
+        self.sources_text.configure(height=5, font=("Microsoft YaHei UI", 9))
         self.repair_panel = ttk.Frame(answers, style="Card.TFrame")
         repair_label = ttk.Label(self.repair_panel, textvariable=self.repair_notice,
                                  style="Hint.TLabel", wraplength=330)
@@ -597,8 +654,10 @@ class EchoMindWindow:
         history_status = ttk.Label(history, textvariable=self.history_status, style="Card.TLabel", foreground=COLORS["muted"], wraplength=330)
         history_status.pack(side="bottom", fill="x", pady=(8, 0))
         self.history_text = self._text(history)
+        self.history_sources_button = ttk.Button(history, text="查看本次参考资料", style="Text.TButton", command=self._history_sources)
+        self.history_sources_button.pack(anchor="w", before=self.history_text.master)
         history.bind("<Configure>", lambda e: [label.configure(wraplength=max(120, e.width - 56)) for label in (history_question, history_status)])
-        test = ttk.Frame(main, style="Panel.TFrame", padding=12)
+        test = ttk.Frame(main, style="Panel.TFrame", padding=16)
         test.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         test.columnconfigure(0, weight=1)
         test.columnconfigure((1, 2), uniform="editor_actions")
@@ -759,8 +818,8 @@ class EchoMindWindow:
 
     def _preview_screenshot(self, text):
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
         dialog.title("核对截图中的面试题")
-        dialog.geometry("760x480")
         dialog.minsize(540, 360)
         dialog.transient(self.root)
         dialog.configure(bg=COLORS["surface"])
@@ -811,7 +870,7 @@ class EchoMindWindow:
         dialog.update_idletasks()
         minimum_width = max(540, actions.winfo_reqwidth() + 32)
         dialog.minsize(minimum_width, 360)
-        dialog.geometry(f"{max(760, minimum_width)}x480")
+        self._center_dialog(dialog, (max(760, minimum_width), 480))
         editor.focus_set()
         dialog.wait_visibility()
         dialog.grab_set()
@@ -935,12 +994,31 @@ class EchoMindWindow:
         root = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[3]
         return resolve_runtime(root, self._selected_model_path())
 
+    def _component_selection_changed(self, event=None):
+        if self.component_kind.get() != KNOWLEDGE_MODEL.name:
+            self.asr_engine.set(self.component_kind.get())
+            self._asr_engine_changed()
+        self._component_state()
+
     def _component_items(self):
+        if self.component_dialog is not None and self.component_kind.get() == KNOWLEDGE_MODEL.name:
+            return [] if knowledge_model_ready() else [KNOWLEDGE_MODEL]
         if self._engine() == "qwen3-asr-1.7b":
             return missing_qwen(self._selected_model_path(), self._qwen_runtime_path())
         return missing(self.model_path, self.cuda_dir, DEVICE_MODES[self.device.get()])
 
     def _component_state(self):
+        knowledge = self.component_dialog is not None and self.component_kind.get() == KNOWLEDGE_MODEL.name
+        if knowledge:
+            items = self._component_items()
+            self.component_details.set("本地中文语义检索 · CPU · 约 91 MB · 不上传资料，不需要 GPU。")
+            if not self.downloading_components:
+                self.component_notice.set("需要下载知识库检索模型。" if items else "知识库检索模型已就绪；可到知识库重建语义索引。")
+            self.component_download_button.configure(state="normal" if items and not self.downloading_components else "disabled")
+            self.component_engine_combo.configure(state="disabled" if self.downloading_components else "readonly")
+            self.component_device_combo.configure(state="disabled")
+            self.component_close_button.configure(text="取消下载" if self.downloading_components else "关闭")
+            return
         qwen = self._engine() == "qwen3-asr-1.7b"
         items = self._component_items()
         details = ("需要 NVIDIA 显卡及驱动，约 4 GB 显存；无需另装 Python。\n"
@@ -963,14 +1041,16 @@ class EchoMindWindow:
             self.component_device_combo.configure(state="disabled" if self.downloading_components or qwen else "readonly")
             self.component_close_button.configure(text="取消下载" if self.downloading_components else "关闭")
 
-    def open_components(self):
+    def open_components(self, *, knowledge=False):
         if self.component_dialog is not None and self.component_dialog.winfo_exists():
             self.component_dialog.lift()
             return
         if self.root.grab_current() is not None or self.updating or (self.session and self.session.is_running):
             return
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
         self.component_dialog = dialog
+        self.component_kind.set(KNOWLEDGE_MODEL.name if knowledge else self.asr_engine.get())
         dialog.title("设置 · 语音组件 · EchoMind")
         dialog.transient(self.root)
         frame = ttk.Frame(dialog, padding=24, style="Card.TFrame")
@@ -981,10 +1061,10 @@ class EchoMindWindow:
         row = ttk.Frame(frame, style="Card.TFrame")
         row.grid(row=1, column=0, sticky="ew", pady=(0, 16))
         ttk.Label(row, text="识别引擎", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
-        self.component_engine_combo = ttk.Combobox(row, textvariable=self.asr_engine,
-            values=[ENGINE_LABELS[key] for key in ("whisper", "qwen3-asr-1.7b")], state="readonly", width=30)
+        self.component_engine_combo = ttk.Combobox(row, textvariable=self.component_kind,
+            values=[*[ENGINE_LABELS[key] for key in ("whisper", "qwen3-asr-1.7b")], KNOWLEDGE_MODEL.name], state="readonly", width=30)
         self.component_engine_combo.grid(row=0, column=1, sticky="w", pady=(0, 8))
-        self.component_engine_combo.bind("<<ComboboxSelected>>", lambda _: (self._asr_engine_changed(), self._component_state()))
+        self.component_engine_combo.bind("<<ComboboxSelected>>", self._component_selection_changed)
         ttk.Label(row, text="Whisper 设备", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 12))
         self.component_device_combo = ttk.Combobox(row, textvariable=self.device, values=list(DEVICE_MODES), state="readonly", width=16)
         self.component_device_combo.grid(row=1, column=1, sticky="w")
@@ -1016,13 +1096,13 @@ class EchoMindWindow:
         self._component_state()
         dialog.update_idletasks()
         dialog.minsize(max(540, actions.winfo_reqwidth() + 48), frame.winfo_reqheight())
-        dialog.geometry(f"640x{max(420, frame.winfo_reqheight())}")
+        self._center_dialog(dialog, (640, max(420, frame.winfo_reqheight())))
         dialog.wait_visibility()
         dialog.grab_set()
         self.component_download_button.focus_set()
 
     def download_components(self):
-        if self.downloading_components or self.updating or (not getattr(sys, "frozen", False) and self._engine() != "qwen3-asr-1.7b"):
+        if self.downloading_components or self.updating or (not getattr(sys, "frozen", False) and self._engine() != "qwen3-asr-1.7b" and self.component_kind.get() != KNOWLEDGE_MODEL.name):
             return
         items = self._component_items()
         if not items:
@@ -1054,6 +1134,7 @@ class EchoMindWindow:
             self.update_dialog.lift()
             return
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
         self.update_dialog = dialog
         dialog.title("设置 · 检查更新 · EchoMind")
         dialog.transient(self.root)
@@ -1092,7 +1173,7 @@ class EchoMindWindow:
         dialog.update_idletasks()
         minimum_width = max(540, actions.winfo_reqwidth() + 48)
         dialog.minsize(minimum_width, 360)
-        dialog.geometry(f"{max(620, minimum_width)}x450")
+        self._center_dialog(dialog, (max(620, minimum_width), 450))
         dialog.wait_visibility()
         dialog.grab_set()
         self._update_buttons()
@@ -1191,7 +1272,7 @@ class EchoMindWindow:
         popup.delete("panel")
         for left, top, right, bottom, fill in ((4, 4, width - 2, height - 1, COLORS["border"]),
                                              (2, 2, width - 4, height - 4, COLORS["surface"])):
-            radius = 8
+            radius = 14
             points = (left + radius, top, right - radius, top, right, top, right, top + radius,
                       right, bottom - radius, right, bottom, right - radius, bottom, left + radius, bottom,
                       left, bottom, left, bottom - radius, left, top + radius, left, top)
@@ -1308,6 +1389,74 @@ class EchoMindWindow:
             if not self.destroyed:
                 self._follow_timer = self.root.after(250, self._follow_tick)
 
+    def open_knowledge(self):
+        if self.knowledge_window is not None and not self.knowledge_window.closed:
+            self.knowledge_window.root.lift()
+            return
+        if self.root.grab_current() is not None or self.closing:
+            return
+        from .knowledge_ui import KnowledgeWindow
+        self.knowledge_window = KnowledgeWindow(self, self.settings_path.parent / "knowledge", COLORS)
+
+    @staticmethod
+    def _source_content(sources):
+        return "\n\n".join(f"[K{index}] {hit.title}\n{hit.source} · {hit.location}\n{hit.text}"
+                            for index, hit in enumerate(sources, 1)) or "本次没有引用本地资料。"
+
+    def _toggle_sources(self):
+        if self.sources_panel.winfo_manager():
+            self.sources_panel.pack_forget()
+        else:
+            self._write(self.sources_text, self._source_content(self.answer_sources), replace=True)
+            self.sources_panel.pack(fill="x", before=self.answer_text.master)
+
+    def _history_sources(self):
+        selected = self.history_tree.selection()
+        if not selected or selected[0] not in self.question_records or self.root.grab_current() is not None:
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("本次参考资料 · EchoMind")
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, style="Card.TFrame", padding=20)
+        frame.pack(fill="both", expand=True)
+        ttk.Button(frame, text="关闭", command=dialog.destroy).pack(side="bottom", anchor="e", pady=(12, 0))
+        text = self._text(frame)
+        self._write(text, self._source_content(self.question_records[selected[0]].sources), replace=True)
+        dialog.bind("<Escape>", lambda _: dialog.destroy() or "break")
+        dialog.minsize(540, 360)
+        self._center_dialog(dialog, (740, 500))
+        dialog.wait_visibility()
+        dialog.grab_set()
+
+    def _center_dialog(self, dialog, size=None):
+        """Position before showing, on the owner's monitor (including negative origins)."""
+        self.root.update_idletasks()
+        dialog.update_idletasks()
+        minimum = dialog.minsize()
+        width, height = size or (dialog.winfo_reqwidth(), dialog.winfo_reqheight())
+        width, height = max(width, minimum[0]), max(height, minimum[1])
+        try:
+            api = WindowsAPI()
+            handle = api.root_handle(self.root.winfo_id())
+            left, top, right, bottom = api.rect(handle)
+            work_left, work_top, work_right, work_bottom = api.work_area(handle)
+            # Include the title bar and window borders when centering/clamping.
+            outer_width = width + max(0, right - left - self.root.winfo_width())
+            outer_height = height + max(0, bottom - top - self.root.winfo_height())
+        except OSError:
+            left, top = self.root.winfo_x(), self.root.winfo_y()
+            right, bottom = left + self.root.winfo_width(), top + self.root.winfo_height()
+            work_left, work_top = self.root.winfo_vrootx(), self.root.winfo_vrooty()
+            work_right = work_left + self.root.winfo_vrootwidth()
+            work_bottom = work_top + self.root.winfo_vrootheight()
+            outer_width, outer_height = width, height
+        x = max(work_left, min(left + (right - left - outer_width) // 2, max(work_left, work_right - outer_width)))
+        y = max(work_top, min(top + (bottom - top - outer_height) // 2, max(work_top, work_bottom - outer_height)))
+        # Explicit '+' prefixes keep negative coordinates absolute, not right/bottom offsets.
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.deiconify()
+
     def open_follow_settings(self):
         if self.follow_dialog is not None and self.follow_dialog.winfo_exists():
             self.follow_dialog.lift()
@@ -1315,6 +1464,7 @@ class EchoMindWindow:
         if self.root.grab_current() is not None:
             return
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
         self.follow_dialog = dialog
         dialog.title("设置 · 窗口跟随 · EchoMind")
         dialog.transient(self.root)
@@ -1361,6 +1511,7 @@ class EchoMindWindow:
         dialog.bind("<Escape>", lambda _: cancel() or "break")
         dialog.update_idletasks()
         dialog.minsize(max(540, dialog.winfo_reqwidth()), dialog.winfo_reqheight())
+        self._center_dialog(dialog)
         self.follow_toggle.focus_set()
         dialog.wait_visibility()
         dialog.grab_set()
@@ -1373,6 +1524,7 @@ class EchoMindWindow:
         if self.settings_button.instate(["disabled"]):
             return
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
         self.settings_dialog = dialog
         dialog.title("设置 · 快捷键 · EchoMind")
         dialog.transient(self.root)
@@ -1422,6 +1574,7 @@ class EchoMindWindow:
         dialog.bind("<Escape>", lambda event: cancel() or "break")
         dialog.update_idletasks()
         dialog.minsize(dialog.winfo_reqwidth(), dialog.winfo_reqheight())
+        self._center_dialog(dialog)
         entries[0].focus_set()
         dialog.wait_visibility()
         dialog.grab_set()
@@ -1430,7 +1583,7 @@ class EchoMindWindow:
         values = {"api_base_url": self.api_url.get().strip(), "api_model": self.api_model.get().strip(),
                   "api_key": self.api_key.get().strip(), "jev_key": self.jev_key.get().strip(),
                   "answer_mode": ANSWER_MODES[self.mode.get()], "device": DEVICE_MODES[self.device.get()],
-                  "source": self.source.get(), "jev_enabled": self.jev.get(),
+                  "source": self.source.get(), "jev_enabled": self.jev.get(), "knowledge_enabled": self.knowledge_enabled.get(),
                   "follow_enabled": self.follow_enabled.get(), "follow_side": self.follow_side.get(),
                   "asr_hotwords": self.asr_hotwords.get().strip(), "asr_model_path": self.asr_model_path.get().strip()}
         values["asr_engine"] = self._engine()
@@ -1482,12 +1635,17 @@ class EchoMindWindow:
 
     def _source_changed(self):
         local = self.source.get() == "本机麦克风"
+        if local and self.capture_after_refresh:
+            self.capture_after_refresh = False
+            self._busy(False)
         self.refresh_button.pack_forget()
         if not local:
             self.refresh_button.pack(side="left", before=self.start_button, padx=(0, 8))
         self.start_button.configure(text="开始测试" if local else "开始采集")
         self.partial.set("点击开始测试后，请对着本机麦克风说话。" if local else "等待会议声音；当前不直接采集你的麦克风。")
         self.status.set("就绪 · 使用系统默认麦克风" if local else "就绪 · 请刷新会议进程")
+        if not local:
+            self.refresh()
 
     def _record_answer(self, event):
         key = f"{self.run_id}:{event.question_id}"
@@ -1511,11 +1669,15 @@ class EchoMindWindow:
         if event.kind == "delta":
             previous_length = len(record.answer)
             record.answer = (record.answer + event.text)[:20_000]
+        elif event.kind == "knowledge":
+            record.sources, record.retrieval_ms = event.sources, event.retrieval_ms
         elif event.kind == "done":
             record.answer = event.text[:20_000]
             record.status = "已完成"
             first = f"{event.first_token_ms:.0f} ms" if event.first_token_ms is not None else "无内容"
             record.metrics = f"模型首字 {first} · 总计 {event.elapsed_ms:.0f} ms"
+            if record.retrieval_ms is not None:
+                record.metrics += f" · 本地检索 {record.retrieval_ms:.0f} ms"
         elif event.kind == "cancelled":
             record.status, record.metrics = "已停止", "回答已停止，保留已生成内容。"
         elif event.kind == "error":
@@ -1617,12 +1779,13 @@ class EchoMindWindow:
         self.refreshing = True
         self.refresh_button.configure(state="disabled")
         self.status.set("正在查找腾讯会议…")
+        discover_processes, events = self.discover, self.events
 
         def discover():
             try:
-                self.events.put((None, "processes", self.discover()))
+                events.put((None, "processes", discover_processes()))
             except Exception:
-                self.events.put((None, "discovery_error", "无法查找会议进程，请启动腾讯会议后刷新。"))
+                events.put((None, "discovery_error", "无法查找会议进程，请确认腾讯会议已启动后重试。"))
 
         threading.Thread(target=discover, name="echomind-discovery", daemon=True).start()
 
@@ -1644,6 +1807,7 @@ class EchoMindWindow:
         if self.hotwords_button.instate(["disabled"]) or self.root.grab_current() is not None:
             return
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
         self.hotwords_dialog = dialog
         dialog.title("编辑技术热词 · EchoMind")
         dialog.transient(self.root)
@@ -1712,7 +1876,7 @@ class EchoMindWindow:
         width = max(540, actions.winfo_reqwidth() + 48)
         height = frame.winfo_reqheight() + 140
         dialog.minsize(width, height)
-        dialog.geometry(f"{max(640, width)}x{max(440, height)}")
+        self._center_dialog(dialog, (max(640, width), max(440, height)))
         dialog.wait_visibility()
         dialog.grab_set()
         editor.focus_set()
@@ -1766,7 +1930,7 @@ class EchoMindWindow:
             raise ValueError("提交问题前，请把回答方式改为“离线演练”或“DeepSeek 在线回答”。")
         pid = 0 if text_test or local else self.processes.get(self.process.get(), 0)
         if not text_test and not local and pid <= 0:
-            raise ValueError("请启动腾讯会议，刷新并选择一个会议进程。")
+            raise ValueError("未找到腾讯会议主进程，请确认腾讯会议已启动后重试。")
         if not text_test and self._engine() != "tencent" and (self.asr_model_path.get().strip() or self._engine() != "whisper"):
             selected = self._selected_model_path()
             if not selected.is_absolute():
@@ -1781,11 +1945,17 @@ class EchoMindWindow:
                              question_threshold=self._question_threshold(),
                              api_base_url=self.api_url.get().strip(), api_model=self.api_model.get().strip(),
                              api_key=self.api_key.get().strip(), jev_key=self.jev_key.get().strip(),
-                             microphone=local, asr_hotwords=self.asr_hotwords.get().strip(), asr_engine=self._engine(), tencent=tencent)
+                             microphone=local, asr_hotwords=self.asr_hotwords.get().strip(), asr_engine=self._engine(), tencent=tencent,
+                             knowledge_enabled=self.knowledge_enabled.get(), knowledge_directory=self.settings_path.parent / "knowledge")
 
-    def _start(self, question=None):
+    def _start(self, question=None, *, processes_ready=False):
         if self.session and self.session.is_running:
             return
+        if self.closing or self.destroyed:
+            return
+        if question is not None and self.capture_after_refresh:
+            self.capture_after_refresh = False
+            self._busy(False)
         if self.downloading_components:
             self.error.set("请等待组件准备完成，或取消下载后再运行。")
             return
@@ -1796,6 +1966,12 @@ class EchoMindWindow:
                 return
         if question is None and self._engine() == "qwen3-asr-1.7b" and self._component_items():
             self.open_components()
+            return
+        if question is None and self.source.get() == "腾讯会议" and not processes_ready:
+            self.error.set("")
+            self.capture_after_refresh = True
+            self._busy(True)
+            self.refresh()
             return
         self.error.set("")
         try:
@@ -1867,6 +2043,10 @@ class EchoMindWindow:
         self.stop_button.configure(state="normal" if busy else "disabled")
 
     def stop(self):
+        if self.capture_after_refresh:
+            self.capture_after_refresh = False
+            self._busy(False)
+            self.status.set("已取消启动采集")
         if self.session:
             self.session.stop()
             self.status.set("正在停止并释放资源…")
@@ -1929,8 +2109,15 @@ class EchoMindWindow:
         if kind in ("processes", "discovery_error"):
             self.refreshing = False
             running = bool(self.session and self.session.is_running)
+            pending_capture = self.capture_after_refresh
+            self.capture_after_refresh = False
+            if pending_capture and not running:
+                self._busy(False)
             self.refresh_button.configure(state="disabled" if running else "normal")
             if kind == "discovery_error":
+                self.processes.clear()
+                self.process_details = []
+                self.process.set("")
                 if self.source.get() == "本机麦克风":
                     return
                 self.error.set(payload)
@@ -1943,6 +2130,13 @@ class EchoMindWindow:
             self.application_notice.set("已连接腾讯会议 · 主进程已自动选择" if chosen else "未找到腾讯会议 · 启动应用后点击刷新")
             if not running and self.source.get() == "腾讯会议":
                 self.status.set(self.application_notice.get())
+                if chosen:
+                    if pending_capture or "会议进程" in self.error.get() or "会议主进程" in self.error.get():
+                        self.error.set("")
+                    if pending_capture and not self.closing:
+                        self._start(processes_ready=True)
+                elif pending_capture:
+                    self.error.set("未找到腾讯会议主进程，请确认腾讯会议已启动后重试。")
         elif kind == "status":
             self.status.set(payload)
         elif kind == "error":
@@ -1968,12 +2162,21 @@ class EchoMindWindow:
             event = payload
             self._record_answer(event)
             if event.kind == "start":
+                self.answer_sources = ()
+                self.retrieval_ms = None
+                self.sources_button.pack_forget()
+                self.sources_panel.pack_forget()
                 self._clear_repair()
                 self.detection.set("已识别提问，正在生成回答。")
                 self.answer_id = event.question_id
                 self.question.set(event.question)
                 self.metrics.set("正在生成回答…")
                 self._write(self.answer_text, "", replace=True)
+            elif event.kind == "knowledge" and event.question_id == self.answer_id:
+                self.answer_sources, self.retrieval_ms = event.sources, event.retrieval_ms
+                self.sources_button.configure(text=f"参考资料（{len(event.sources)}） · 点击展开")
+                self.sources_button.pack(fill="x", before=self.answer_text.master)
+                self.detection.set(event.text)
             elif event.kind == "delta" and event.question_id == self.answer_id:
                 self._write(self.answer_text, event.text)
                 self.detection.set("正在流式生成回答…")
@@ -1983,6 +2186,8 @@ class EchoMindWindow:
                 self.detection.set("回答已完成。")
                 first = f"{event.first_token_ms:.0f} ms" if event.first_token_ms is not None else "无内容"
                 decision = f" · 语义判断 {event.decision_ms:.0f} ms" if event.decision_ms is not None else ""
+                if self.retrieval_ms is not None:
+                    decision += f" · 本地检索 {self.retrieval_ms:.0f} ms"
                 self.metrics.set(f"模型首字 {first} · 总计 {event.elapsed_ms:.0f} ms{decision}")
             elif event.kind == "checking":
                 self.detection.set("正在语义确认：" + event.question)
@@ -2070,12 +2275,17 @@ class EchoMindWindow:
             self.root.after_cancel(self._component_timer)
         self.api_key.set("")
         self.jev_key.set("")
+        for variable in (self.mode, self.asr_hotwords, self.error):
+            for modes, callback in variable.trace_info():
+                variable.trace_remove(modes, callback)
         self.question_records.clear()
         self.session = None
         self.root.destroy()
 
 
 def main():
+    from .diagnostics import enable_fault_log
+    enable_fault_log()
     if os.name == "nt":
         import ctypes
         try:

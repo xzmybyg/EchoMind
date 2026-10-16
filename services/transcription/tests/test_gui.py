@@ -37,6 +37,219 @@ def test_selects_main_process_not_crash_handler():
     assert preferred_pid([]) is None
 
 
+def test_switching_to_meeting_refreshes_processes_automatically(window, monkeypatch):
+    refreshed = []
+    monkeypatch.setattr(window, 'refresh', lambda: refreshed.append(True))
+    window.source.set('本机麦克风')
+    window._source_changed()
+    window.source.set('腾讯会议')
+    window._source_changed()
+    assert refreshed == [True]
+
+
+def test_start_waits_for_fresh_processes_and_uses_new_main_pid(window, monkeypatch):
+    started, refreshed = [], []
+    window.source.set('腾讯会议')
+    window._handle('processes', [{'Name':'wemeetapp.exe', 'ProcessId':10}])
+    monkeypatch.setattr(window, 'refresh', lambda: refreshed.append(True))
+    class Session:
+        is_running = True
+        def start(self, question=None):
+            started.append(window._config().pid)
+        def stop(self):
+            self.is_running = False
+    monkeypatch.setattr(window, 'session_factory', lambda *args: Session())
+    window.start_capture()
+    assert not started and refreshed == [True]
+    assert window.stop_button.instate(['!disabled'])
+    window._handle('processes', [{'Name':'wemeetapp.exe', 'ProcessId':42}])
+    assert started == [42]
+
+
+@pytest.mark.parametrize('outcome', ['stop', 'discovery_error', 'empty'])
+def test_pending_capture_can_be_cancelled_and_discovery_failure_never_starts(window, monkeypatch, outcome):
+    monkeypatch.setattr(window, 'refresh', lambda: None)
+    monkeypatch.setattr(window, 'session_factory', lambda *args: pytest.fail('must not start capture'))
+    window.source.set('腾讯会议')
+    window.start_capture()
+    assert window.session is None
+    if outcome == 'stop':
+        window.stop()
+        window._handle('processes', [{'Name':'wemeetapp.exe', 'ProcessId':42}])
+    elif outcome == 'empty':
+        window._handle('processes', [])
+    else:
+        window._handle('discovery_error', '无法查找会议进程')
+    assert window.start_button.instate(['!disabled'])
+    assert window.stop_button.instate(['disabled'])
+
+
+def test_discovery_worker_does_not_keep_window_or_tk_objects_alive(monkeypatch):
+    import gc
+    import threading
+    import weakref
+    from unittest.mock import Mock
+    entered, release = threading.Event(), threading.Event()
+    def discover():
+        entered.set()
+        release.wait(3)
+        return []
+    class Subject:
+        refreshing = False
+        session = None
+    import queue
+    subject = Subject()
+    subject.discover = discover
+    subject.events = queue.Queue()
+    subject.refresh_button, subject.status = Mock(), Mock()
+    reference = weakref.ref(subject)
+    EchoMindWindow.refresh(subject)
+    assert entered.wait(2)
+    del subject
+    try:
+        gc.collect()
+        assert reference() is None, 'The worker must not retain the Tk owner after its window is closed'
+    finally:
+        release.set()
+
+
+def test_destroy_releases_variable_callbacks_that_retain_the_window(window):
+    variables = (window.mode, window.asr_hotwords, window.error)
+    assert all(variable.trace_info() for variable in variables)
+    window._destroy()
+    assert all(not variable.trace_info() for variable in variables)
+
+
+def _wait_knowledge(window):
+    import time
+    manager = window.knowledge_window
+    deadline = time.monotonic() + 5
+    while manager.busy and time.monotonic() < deadline:
+        window.root.update()
+        time.sleep(.02)
+    assert not manager.busy
+    return manager
+
+
+def test_knowledge_manager_defaults_off_persists_and_keeps_main_layout(window):
+    from echomind.settings import load_settings
+    window.root.deiconify()
+    window.root.update()
+    geometry = window.root.geometry()
+    assert not window.knowledge_enabled.get()
+    window.knowledge_button.invoke()
+    manager = _wait_knowledge(window)
+    assert manager.service.database.parent == window.settings_path.parent / 'knowledge'
+    assert window.root.geometry() == geometry
+    assert window.root.grab_current() == manager.root
+    window.knowledge_enabled.set(True)
+    manager._enable()
+    assert load_settings(window.settings_path)['knowledge_enabled'] is True
+    manager.close()
+    assert manager.closed
+
+
+def test_knowledge_manager_manual_editor_and_search_are_local(window):
+    from tkinter import ttk
+    window.root.deiconify()
+    window.open_knowledge()
+    manager = _wait_knowledge(window)
+    manager.new_question()
+    dialog = next(child for child in manager.root.winfo_children() if isinstance(child, tk.Toplevel))
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from descendants(child)
+    children = list(descendants(dialog))
+    entries = [w for w in children if isinstance(w, ttk.Entry)]
+    entries[0].insert(0, 'React Hooks')
+    entries[1].insert(0, 'Hooks')
+    editor = next(w for w in children if isinstance(w, tk.Text))
+    editor.insert('1.0', 'useState 管理组件状态。')
+    next(w for w in children if isinstance(w, ttk.Button) and w.cget('text') == '保存').invoke()
+    _wait_knowledge(window)
+    assert len(manager.tree.get_children()) == 1
+    manager.search.set('Hooks')
+    manager.find()
+    _wait_knowledge(window)
+    assert '找到 1' in manager.notice.get()
+    assert not window.session
+    manager.close()
+
+
+def test_knowledge_import_preview_requires_confirmation(window, tmp_path):
+    from echomind.knowledge_import import preview_document
+    from tkinter import ttk
+    path = tmp_path / '题库.md'
+    path.write_text('# Redis\n\n内存读写。', encoding='utf-8')
+    window.root.deiconify()
+    window.open_knowledge()
+    manager = _wait_knowledge(window)
+    manager._preview(preview_document(path))
+    assert not manager.service.list_documents()
+    dialog = next(child for child in manager.root.winfo_children() if isinstance(child, tk.Toplevel))
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from descendants(child)
+    window.root.update()
+    confirm = next(w for w in descendants(dialog) if isinstance(w, ttk.Button) and w.cget('text') == '确认导入')
+    assert confirm.winfo_ismapped()
+    assert confirm.winfo_rooty() + confirm.winfo_height() <= dialog.winfo_rooty() + dialog.winfo_height()
+    confirm.invoke()
+    _wait_knowledge(window)
+    assert len(manager.service.list_documents()) == 1
+    assert path.exists()
+    manager.close()
+
+
+def test_knowledge_component_selection_does_not_change_asr(window, monkeypatch):
+    from echomind.knowledge_model import KNOWLEDGE_MODEL
+    monkeypatch.setattr('echomind.gui.knowledge_model_ready', lambda: False)
+    before = window.asr_engine.get()
+    window.root.deiconify()
+    window.open_components(knowledge=True)
+    assert window._component_items() == [KNOWLEDGE_MODEL]
+    assert window.asr_engine.get() == before
+    assert window.component_device_combo.instate(['disabled'])
+    assert window.component_download_button.instate(['!disabled'])
+    assert 'CPU' in window.component_details.get()
+    window.component_close_button.invoke()
+
+
+@pytest.mark.parametrize('scaling', [96/72, 120/72, 144/72])
+def test_knowledge_manager_toolbar_and_actions_fit_scaled_window(window, scaling):
+    previous = window.root.tk.call('tk', 'scaling')
+    window.root.tk.call('tk', 'scaling', scaling)
+    window.root.deiconify()
+    try:
+        window.open_knowledge()
+        manager = _wait_knowledge(window)
+        window.root.update()
+        for button in manager.buttons:
+            assert button.winfo_ismapped()
+            assert button.winfo_rootx() + button.winfo_width() <= manager.root.winfo_rootx() + manager.root.winfo_width()
+            assert button.winfo_rooty() + button.winfo_height() <= manager.root.winfo_rooty() + manager.root.winfo_height()
+        manager.close()
+    finally:
+        window.root.tk.call('tk', 'scaling', previous)
+
+
+def test_answer_sources_expand_and_history_snapshot_survives_new_question(window):
+    from echomind.knowledge import KnowledgeHit
+    hit = KnowledgeHit(1, 'doc', 'React Hooks', '题库.md', '第 3 行', '状态与副作用', .7)
+    window.root.deiconify()
+    window._handle('answer', AnswerEvent('start', 1, 'Hooks'))
+    window._handle('answer', AnswerEvent('knowledge', 1, 'Hooks', '混合检索', sources=(hit,), retrieval_ms=15))
+    window.sources_button.invoke()
+    assert '第 3 行' in window.sources_text.get('1.0', 'end')
+    record = window.question_records['0:1']
+    assert record.sources == (hit,)
+    window._handle('answer', AnswerEvent('start', 2, 'Redis'))
+    assert not window.answer_sources and not window.sources_panel.winfo_manager()
+    assert record.sources == (hit,)
+
+
 def test_qwen_option_selects_gpu_and_persists(window, monkeypatch):
     from echomind.asr_backends import ENGINE_LABELS
     from echomind.settings import load_settings
@@ -1059,11 +1272,11 @@ def test_screenshot_preview_selects_one_question_and_preserves_draft(window):
     assert window.session is None
 
 
-def test_ant_design_palette_and_accessible_action_states(window):
+def test_warm_workspace_palette_and_accessible_action_states(window):
     from tkinter import ttk
     style = ttk.Style(window.root)
-    assert COLORS["primary"] == "#1677FF"
-    assert COLORS["background"] == "#F5F5F5"
+    assert COLORS["primary"] == "#7A6046"
+    assert COLORS["background"] == "#FAF9F6"
     assert window.test_button.cget("style") == "Primary.TButton"
     assert style.lookup("TEntry", "bordercolor", ("focus",)) == COLORS["primary"]
     assert style.lookup("Primary.TButton", "foreground", ("disabled",)) == COLORS["disabled"]
@@ -1077,6 +1290,147 @@ def test_ant_design_palette_and_accessible_action_states(window):
     for state in ((), ("active",), ("pressed",)):
         background = style.lookup("Primary.TButton", "background", state)
         assert (1.0 + 0.05) / (luminance(background) + 0.05) >= 4.5
+    for foreground, background in ((COLORS["text"], COLORS["surface"]),
+                                  (COLORS["muted"], COLORS["table_header"]),
+                                  (COLORS["primary"], COLORS["tint"]),
+                                  (COLORS["muted"], COLORS["rail"])):
+        assert (luminance(background) + 0.05) / (luminance(foreground) + 0.05) >= 4.5
+
+
+def test_warm_surfaces_preserve_native_controls_and_focus(window):
+    from tkinter import ttk
+    style = ttk.Style(window.root)
+    for name in ("TButton", "Primary.TButton", "Panel.TFrame", "TEntry", "TCombobox", "TNotebook.Tab"):
+        assert "Warm" in str(style.layout(name))
+    assert "Entry.textarea" in str(style.layout("TEntry"))
+    assert "Combobox.downarrow" in str(style.layout("TCombobox"))
+    assert style.lookup("TNotebook.Tab", "foreground", ("selected",)) == COLORS["text"]
+    assert style.lookup("Horizontal.TProgressbar", "background") == COLORS["primary"]
+    assert style.lookup("Settings.TNotebook", "background") == COLORS["surface"]
+    assert tuple(map(int, style.lookup("Settings.TNotebook", "tabmargins"))) == (0, 0, 0, 0)
+    window.source_combo.set("本机麦克风")
+    window.source_combo.event_generate("<<ComboboxSelected>>")
+    assert window.start_button.cget("text") == "开始测试"
+    window.test_question.set("编辑内容不受主题影响")
+    assert window.question_entry.get() == "编辑内容不受主题影响"
+
+
+def test_empty_error_does_not_reserve_workspace_height(window):
+    from tkinter import ttk
+    main = window.capture_toolbar.master
+    error_label = next(child for child in main.winfo_children()
+                       if isinstance(child, ttk.Label) and child.cget("style") == "Error.TLabel")
+    assert not error_label.grid_info()
+    window.error.set("测试错误提示")
+    assert error_label.grid_info()
+    window.error.set("")
+    assert not error_label.grid_info()
+
+
+@pytest.mark.parametrize("kind", ["hotwords", "shortcuts", "follow", "components", "update", "screenshot"])
+def test_dialogs_open_centered_on_the_main_window(window, monkeypatch, kind):
+    from echomind.window_follow import WindowsAPI
+    window.root.geometry("1320x820+200+100")
+    window.root.deiconify()
+    window.root.update()
+    api = WindowsAPI()
+    parent = api.rect(api.root_handle(window.root.winfo_id()))
+    states = []
+    position = window._center_dialog
+    def center(dialog, size=None):
+        states.append(dialog.state())
+        return position(dialog, size)
+    monkeypatch.setattr(window, "_center_dialog", center)
+    openers = {"hotwords": window.open_hotwords, "shortcuts": window.open_settings,
+               "follow": window.open_follow_settings, "components": window.open_components,
+               "update": window._open_update_dialog, "screenshot": lambda: window._preview_screenshot("测试题目")}
+    openers[kind]()
+    window.root.update()
+    dialog = next(child for child in window.root.winfo_children() if isinstance(child, tk.Toplevel))
+    rect = api.rect(api.root_handle(dialog.winfo_id()))
+    work = api.work_area(api.root_handle(window.root.winfo_id()))
+    width, height = rect[2] - rect[0], rect[3] - rect[1]
+    expected_x = max(work[0], min((parent[0] + parent[2] - width) // 2, work[2] - width))
+    expected_y = max(work[1], min((parent[1] + parent[3] - height) // 2, work[3] - height))
+    assert abs(rect[0] - expected_x) <= 2
+    assert abs(rect[1] - expected_y) <= 2
+    assert states == ["withdrawn"]
+    assert str(dialog.transient()) == str(window.root)
+    assert window.root.grab_current() == dialog
+    dialog.destroy()
+
+
+@pytest.mark.parametrize("parent,work", [
+    ((-1800, 100, -464, 959), (-1920, 0, 0, 1080)),
+    ((1700, 950, 3036, 1809), (0, 40, 1920, 1040)),
+    ((200, -1000, 1536, -141), (0, -1080, 1920, 0)),
+])
+def test_dialog_centering_handles_negative_monitor_origins_and_screen_edges(window, monkeypatch, parent, work):
+    window.root.geometry("1320x820+200+100")
+    window.root.deiconify()
+    window.root.update()
+    api = SimpleNamespace(root_handle=lambda handle: handle, rect=lambda handle: parent, work_area=lambda handle: work)
+    monkeypatch.setattr("echomind.gui.WindowsAPI", lambda: api)
+    dialog = tk.Toplevel(window.root)
+    dialog.withdraw()
+    seen = []
+    # Record the geometry passed to Tk, preserving explicit absolute negative offsets.
+    original = dialog.geometry
+    monkeypatch.setattr(dialog, "geometry", lambda value: (seen.append(value), original(value))[1])
+    window._center_dialog(dialog, (640, 440))
+    dialog.update()
+    outer_width = 640 + parent[2] - parent[0] - window.root.winfo_width()
+    outer_height = 440 + parent[3] - parent[1] - window.root.winfo_height()
+    x = max(work[0], min((parent[0] + parent[2] - outer_width) // 2, work[2] - outer_width))
+    y = max(work[1], min((parent[1] + parent[3] - outer_height) // 2, work[3] - outer_height))
+    assert seen == [f"640x440+{x}+{y}"]
+    assert (dialog.winfo_x(), dialog.winfo_y()) == (x, y)
+    dialog.destroy()
+
+
+def test_dialog_centering_uses_tk_fallback_if_monitor_query_fails(window, monkeypatch):
+    window.root.geometry("1320x820+200+100")
+    window.root.deiconify()
+    window.root.update()
+    monkeypatch.setattr("echomind.gui.WindowsAPI", lambda: (_ for _ in ()).throw(OSError("monitor unavailable")))
+    dialog = tk.Toplevel(window.root)
+    dialog.withdraw()
+    dialog.minsize(700, 480)
+    window._center_dialog(dialog, (640, 440))
+    dialog.update()
+    assert dialog.winfo_ismapped()
+    assert (dialog.winfo_width(), dialog.winfo_height()) == (700, 480)
+    assert abs(dialog.winfo_x() - (window.root.winfo_x() + (window.root.winfo_width() - 700) // 2)) <= 2
+    dialog.destroy()
+
+
+@pytest.mark.parametrize("scaling", [96 / 72, 120 / 72, 144 / 72])
+def test_warm_workspace_fits_at_common_display_scales(tk_host, tmp_path, scaling):
+    previous = tk_host.tk.call("tk", "scaling")
+    root = tk.Toplevel(tk_host)
+    root.withdraw()
+    app = None
+    try:
+        root.tk.call("tk", "scaling", scaling)
+        app = EchoMindWindow(root, discover=lambda: [], settings_path=tmp_path / "settings.json")
+        factor = scaling / (96 / 72)
+        root.geometry(f"{round(1320 * factor)}x{round(820 * factor)}")
+        root.deiconify()
+        root.update()
+        for control in (app.source_combo, app.start_button, app.question_entry, app.test_button):
+            assert control.winfo_ismapped()
+            assert control.winfo_rootx() + control.winfo_width() <= root.winfo_rootx() + root.winfo_width()
+            assert control.winfo_rooty() + control.winfo_height() <= root.winfo_rooty() + root.winfo_height()
+        assert app.caption_text.winfo_width() >= 180
+        assert app.answer_text.winfo_width() >= 180
+        assert app.caption_text.winfo_height() >= 100
+        assert app.answer_text.winfo_height() >= 100
+    finally:
+        if app:
+            app._destroy()
+        else:
+            root.destroy()
+        tk_host.tk.call("tk", "scaling", previous)
 
 
 def test_tab_sizes_are_equal_and_do_not_change_on_selection(window):

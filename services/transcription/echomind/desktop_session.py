@@ -40,6 +40,8 @@ class SessionConfig:
     asr_hotwords: str = DEFAULT_HOTWORDS
     asr_engine: str = "whisper"
     tencent: TencentConfig = field(default_factory=TencentConfig)
+    knowledge_enabled: bool = False
+    knowledge_directory: Path | None = None
 
 
 class DesktopSession:
@@ -61,6 +63,8 @@ class DesktopSession:
         config = self.config
         if config.answer_mode not in ("off", "demo", "live"):
             raise ValueError("回答模式无效")
+        if not isinstance(config.knowledge_enabled, bool):
+            raise ValueError("知识库启用设置无效")
         if config.question_gate not in ("rules", "jev"):
             raise ValueError("问题判断模式无效")
         if isinstance(config.question_threshold, bool) or not isinstance(config.question_threshold, (int, float)) or not math.isfinite(config.question_threshold) or not 0 <= config.question_threshold <= 1:
@@ -159,8 +163,16 @@ class DesktopSession:
                 reviser = OpenAICompatibleQuestionReviser(
                     config.api_base_url.strip(), config.api_model.strip(), config.api_key.strip(),
                 ) if config.answer_mode == "live" else None
+                knowledge = None
+                if config.knowledge_enabled and config.answer_mode == "live":
+                    from .knowledge import KnowledgeService
+                    try:
+                        knowledge = KnowledgeService(config.knowledge_directory)
+                        knowledge.prepare_async()
+                    except Exception:
+                        self._on_event("status", "知识库暂不可用，保留普通回答。")
                 copilot = Copilot(provider, on_answer, question_gate=gate, question_reviser=reviser,
-                                  question_threshold=config.question_threshold)
+                                  question_threshold=config.question_threshold, knowledge_service=knowledge)
                 if question is None:
                     with self._lock:
                         if not self._stop.is_set():

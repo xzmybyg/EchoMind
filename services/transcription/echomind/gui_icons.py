@@ -21,9 +21,9 @@ def _rounded_box(master, size, border, fill, radius, stroke, gap=0, canvas=None)
     return image
 
 
-def button_background(master, scale, border, fill, canvas):
+def button_background(master, scale, border, fill, canvas, *, radius=14):
     """Nine-slice background resized by ttk without stretching corners."""
-    radius = max(3, round(6 * scale))
+    radius = max(3, round(radius * scale))
     stroke = max(1, round(scale))
     # ttk tiles the center: a one-pixel center would require thousands of draws.
     return _rounded_box(master, max(64, round(64 * scale)), border, fill, radius, stroke, canvas=canvas)
@@ -64,6 +64,7 @@ def navigation_icon(master, name, size, color):
         "follow": [(3, 3, 16, 3, 16, 7), (3, 3, 3, 16, 7, 16), (9, 9, 21, 9, 21, 21, 9, 21, 9, 9)],
         "update": [(5, 8, 12, 2, 19, 8), (12, 2, 12, 16), (3, 16, 3, 21, 21, 21, 21, 16)],
         "component": [(3, 7, 12, 2, 21, 7, 21, 17, 12, 22, 3, 17, 3, 7, 12, 12, 21, 7), (12, 12, 12, 22)],
+        "knowledge": [(3, 4, 9, 4, 12, 6, 15, 4, 21, 4, 21, 20, 15, 20, 12, 22, 9, 20, 3, 20, 3, 4), (12, 6, 12, 22)],
     }
     image = tk.PhotoImage(master=master, width=size, height=size)
     scale = size / 24

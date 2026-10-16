@@ -33,6 +33,7 @@ def meeting_processes() -> list[dict[str, object]]:
         encoding="utf-8",
         errors="replace",
         check=False,
+        timeout=8,
         **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
     )
     if result.returncode:

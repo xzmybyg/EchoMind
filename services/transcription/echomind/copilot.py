@@ -13,6 +13,7 @@ from echomind.question import PausedQuestion, QuestionBuffer, _classify, is_fill
 from echomind.intent import QuestionGate, QuestionGateError
 from echomind.text import normalize_transcript
 from echomind.repair import local_review, normalize_question, suspect_question
+from echomind.knowledge import KnowledgeHit
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,8 @@ class AnswerEvent:
     elapsed_ms: float | None = None
     decision_ms: float | None = None
     reason: str = ""
+    sources: tuple[KnowledgeHit, ...] = ()
+    retrieval_ms: float | None = None
 
 
 class Copilot:
@@ -38,12 +41,14 @@ class Copilot:
         question_gate: QuestionGate | None = None,
         question_threshold: float = 0.85,
         question_reviser=None,
+        knowledge_service=None,
     ) -> None:
         if max_context_turns < 0:
             raise ValueError("max_context_turns must be nonnegative")
         if not math.isfinite(question_threshold) or not 0 <= question_threshold <= 1:
             raise ValueError("question_threshold must be between zero and one")
         self._provider = provider
+        self._knowledge = knowledge_service
         self._on_event = on_event
         self._buffer = question_buffer if question_buffer is not None else QuestionBuffer()
         self._max_context_turns = max_context_turns
@@ -312,11 +317,36 @@ class Copilot:
         first_token_ms = None
         pieces: list[str] = []
         stream = None
+        sources = ()
+        retrieval_ms = None
         try:
             if self._closed or question_id != self._question_id:
                 return
             self._emit(AnswerEvent("start", question_id, question, decision_ms=decision_ms))
-            stream = self._provider.stream_answer(question, [dict(m) for m in self._context])
+            if self._knowledge is not None:
+                retrieval_started = time.perf_counter()
+                cancel = threading.Event()
+                query = question
+                if query.strip("。！!？? ") in ("详细一点", "再详细一点", "展开讲讲", "继续", "举个例子"):
+                    query = next((m['content'] for m in reversed(self._context) if m['role'] == 'user'), query)
+                try:
+                    sources = tuple(await asyncio.wait_for(asyncio.to_thread(self._knowledge.retrieve, query, cancel=cancel), timeout=1))
+                    notice = self._knowledge.notice if sources else "知识库未命中相关资料，使用普通回答。"
+                except asyncio.CancelledError:
+                    cancel.set()
+                    raise
+                except Exception:
+                    cancel.set()
+                    notice = "知识库检索超时或不可用，使用普通回答。"
+                if self._closed or question_id != self._question_id:
+                    return
+                retrieval_ms = (time.perf_counter() - retrieval_started) * 1000
+                self._emit(AnswerEvent("knowledge", question_id, question, notice,
+                                      sources=sources, retrieval_ms=retrieval_ms))
+            context = [dict(m) for m in self._context]
+            provider_started = time.perf_counter()
+            stream = (self._provider.stream_answer(question, context, knowledge=sources) if sources
+                      else self._provider.stream_answer(question, context))
             async for delta in stream:
                 if self._closed or question_id != self._question_id:
                     return
@@ -324,7 +354,7 @@ class Copilot:
                     continue
                 elapsed = (time.perf_counter() - started) * 1000
                 if first_token_ms is None:
-                    first_token_ms = elapsed
+                    first_token_ms = (time.perf_counter() - provider_started) * 1000
                 pieces.append(delta)
                 self._emit(AnswerEvent("delta", question_id, question, delta, first_token_ms, elapsed))
             if self._closed or question_id != self._question_id:
@@ -342,6 +372,7 @@ class Copilot:
                 "done", question_id, question, answer, first_token_ms,
                 (time.perf_counter() - started) * 1000,
                 decision_ms,
+                sources=sources, retrieval_ms=retrieval_ms,
             ))
         except asyncio.CancelledError:
             self._emit(AnswerEvent("cancelled", question_id, question))
